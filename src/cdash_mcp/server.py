@@ -365,7 +365,7 @@ async def get_build_tests(
         status = t.get("status", "?")
         exec_time = t.get("execTime", "?")
         details = t.get("details", "")
-        build_test_id = t.get("id", "")
+        build_test_id = t.get("buildtestid", "")
 
         status_icon = {"Passed": "+", "Failed": "!", "Not Run": "-"}.get(
             status, "?"
@@ -463,7 +463,7 @@ async def get_test_details(
     lines: list[str] = []
 
     test = data.get("test", {})
-    test_name = test.get("name", "?")
+    test_name = test.get("test", test.get("name", "?"))
     status = test.get("status", "?")
     command = test.get("command", "")
     output = test.get("output", "")

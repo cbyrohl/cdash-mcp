@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from datetime import date as date_type
 from typing import Any
 
 import httpx
@@ -79,6 +80,11 @@ class CDashClient:
             raise CDashAuthError(
                 f"Authentication failed ({resp.status_code}). "
                 "Check your CDASH_TOKEN environment variable."
+            )
+        if resp.status_code == 400:
+            raise CDashError(
+                f"Bad request for {path}. "
+                "Check that all required parameters are provided."
             )
         if resp.status_code == 404:
             raise CDashNotFoundError(f"Resource not found: {path}")
@@ -235,9 +241,11 @@ class CDashClient:
             date: Optional date string (YYYY-MM-DD).
         """
         project_id = await self._resolve_project_id(project)
-        params: dict[str, Any] = {"project": project_id, "name": test_name}
-        if date:
-            params["date"] = date
+        params: dict[str, Any] = {
+            "project": project_id,
+            "name": test_name,
+            "date": date or date_type.today().isoformat(),
+        }
         return await self._get("/api/v1/testSummary.php", params)
 
     async def get_build_update(self, build_id: int) -> dict[str, Any]:
