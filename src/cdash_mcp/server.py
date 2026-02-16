@@ -1,6 +1,7 @@
 """FastMCP server exposing CDash CI/CD data as tools. [AI-Claude]"""
 
 import logging
+import re
 import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -364,11 +365,14 @@ async def get_build_tests(
         status = t.get("status", "?")
         exec_time = t.get("execTime", "?")
         details = t.get("details", "")
+        build_test_id = t.get("id", "")
 
         status_icon = {"Passed": "+", "Failed": "!", "Not Run": "-"}.get(
             status, "?"
         )
         line = f"- [{status_icon}] **{name}** ({status}, {exec_time}s)"
+        if build_test_id:
+            line += f" [buildtestid={build_test_id}]"
         if details:
             if len(details) > 150:
                 details = details[:150] + "..."
@@ -431,6 +435,441 @@ async def get_configure_output(
                 output = output[:5000] + "\n... (truncated, showing first 5000 chars)"
             lines.append("**Output**:")
             lines.append(f"```\n{output}\n```")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Tool: get_test_details
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+async def get_test_details(
+    build_test_id: int,
+    ctx: Context = None,
+) -> str:
+    """Get detailed output/log for a single test run.
+
+    Args:
+        build_test_id: The CDash build-test ID (from get_build_tests results).
+    """
+    client = _get_client(ctx)
+    try:
+        data = await client.get_test_details(build_test_id)
+    except CDashError as e:
+        return f"Error: {e}"
+
+    lines: list[str] = []
+
+    test = data.get("test", {})
+    test_name = test.get("name", "?")
+    status = test.get("status", "?")
+    command = test.get("command", "")
+    output = test.get("output", "")
+
+    lines.append(f"# Test Details: {test_name}")
+    lines.append(f"**Status**: {status}")
+    lines.append(f"**Build-Test ID**: {build_test_id}")
+    lines.append("")
+
+    if command:
+        lines.append("**Command**:")
+        lines.append(f"```\n{command}\n```")
+        lines.append("")
+
+    # Measurements
+    measurements = test.get("measurements", [])
+    if measurements:
+        lines.append("## Measurements")
+        for m in measurements:
+            name = m.get("name", "?")
+            value = m.get("value", "?")
+            lines.append(f"- **{name}**: {value}")
+        lines.append("")
+
+    if output:
+        if len(output) > 8000:
+            output = output[:8000] + "\n... (truncated, showing first 8000 chars)"
+        lines.append("## Output")
+        lines.append(f"```\n{output}\n```")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Tool: get_test_summary
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+async def get_test_summary(
+    project: str,
+    test_name: str,
+    date: str | None = None,
+    ctx: Context = None,
+) -> str:
+    """Get summary of a test across builds — shows pass/fail history to detect flaky tests.
+
+    Args:
+        project: CDash project name (e.g. "PublicDashboard").
+        test_name: Exact name of the test.
+        date: Optional date (YYYY-MM-DD). Defaults to today.
+    """
+    client = _get_client(ctx)
+    try:
+        data = await client.get_test_summary(project, test_name, date)
+    except CDashError as e:
+        return f"Error: {e}"
+
+    lines: list[str] = []
+    lines.append(f"# Test Summary: {test_name}")
+    lines.append("")
+
+    num_failed = data.get("numfailed", 0)
+    num_total = data.get("numtotal", 0)
+    pct_passed = data.get("percentagepassed", 0)
+    lines.append(
+        f"**Results**: {num_total - num_failed}/{num_total} passed "
+        f"({pct_passed:.1f}%)"
+    )
+    lines.append("")
+
+    builds = data.get("builds", [])
+    if not builds:
+        lines.append("No build results found.")
+        return "\n".join(lines)
+
+    lines.append(f"## Results across {len(builds)} build(s):")
+    lines.append("")
+
+    for b in builds[:50]:
+        site = b.get("site", "?")
+        build_name = b.get("buildName", "?")
+        status = b.get("status", "?")
+        time_val = b.get("time", "?")
+        build_id = b.get("buildid", "?")
+        status_icon = {"Passed": "+", "Failed": "!", "Not Run": "-"}.get(
+            status, "?"
+        )
+
+        line = (
+            f"- [{status_icon}] **{status}** — {build_name} @ {site} "
+            f"(build_id={build_id}, time={time_val}s)"
+        )
+
+        update = b.get("update", {})
+        if update and update.get("revision"):
+            line += f" rev={update['revision'][:12]}"
+        lines.append(line)
+
+    if len(builds) > 50:
+        lines.append(f"\n... and {len(builds) - 50} more (showing first 50)")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Tool: get_build_update
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+async def get_build_update(
+    build_id: int,
+    ctx: Context = None,
+) -> str:
+    """View source code changes (VCS commits) associated with a build.
+
+    Args:
+        build_id: The CDash build ID.
+    """
+    client = _get_client(ctx)
+    try:
+        data = await client.get_build_update(build_id)
+    except CDashError as e:
+        return f"Error: {e}"
+
+    lines: list[str] = []
+    lines.append(f"# Source Updates (build_id={build_id})")
+    lines.append("")
+
+    update = data.get("update", {})
+    if update:
+        revision = update.get("revision", "")
+        prior = update.get("priorrevision", "")
+        if revision:
+            lines.append(f"**Revision**: {revision}")
+        if prior:
+            lines.append(f"**Prior revision**: {prior}")
+        diff_url = update.get("revisiondiff", "")
+        if diff_url:
+            lines.append(f"**Diff URL**: {diff_url}")
+        lines.append("")
+
+    update_groups = data.get("updategroups", [])
+    if not update_groups:
+        lines.append("No source changes found.")
+        return "\n".join(lines)
+
+    total_files = 0
+    for group in update_groups:
+        description = group.get("description", "Files")
+        directories = group.get("directories", [])
+        if not directories:
+            continue
+
+        lines.append(f"## {description}")
+        lines.append("")
+
+        for d in directories:
+            dir_name = d.get("name", ".")
+            files = d.get("files", [])
+            for f in files:
+                filename = f.get("filename", "?")
+                author = f.get("author", "?")
+                log = f.get("log", "").strip()
+                revision = f.get("revision", "")
+
+                path = f"{dir_name}/{filename}" if dir_name != "." else filename
+                line = f"- `{path}` by **{author}**"
+                if revision:
+                    line += f" ({revision[:12]})"
+                lines.append(line)
+                if log:
+                    if len(log) > 200:
+                        log = log[:200] + "..."
+                    lines.append(f"  {log}")
+                total_files += 1
+
+        lines.append("")
+
+    if total_files == 0:
+        lines.append("No source changes found.")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Tool: get_project_overview
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+async def get_project_overview(
+    project: str,
+    date: str | None = None,
+    ctx: Context = None,
+) -> str:
+    """Get project overview with aggregate build/test/coverage statistics.
+
+    Args:
+        project: CDash project name (e.g. "PublicDashboard").
+        date: Optional date (YYYY-MM-DD). Defaults to today.
+    """
+    client = _get_client(ctx)
+    try:
+        data = await client.get_project_overview(project, date)
+    except CDashError as e:
+        return f"Error: {e}"
+
+    lines: list[str] = []
+    title = data.get("title", f"{project} - Overview")
+    lines.append(f"# {title}")
+    lines.append("")
+
+    has_sub = data.get("hasSubProjects", False)
+    if has_sub:
+        lines.append("*This project has subprojects.*")
+        lines.append("")
+
+    # Build groups
+    groups = data.get("groups", [])
+    if groups:
+        group_names = [g.get("name", "?") for g in groups]
+        lines.append(f"**Build groups**: {', '.join(group_names)}")
+        lines.append("")
+
+    # Coverage data
+    coverages = data.get("coverages", [])
+    if coverages:
+        lines.append("## Coverage")
+        for cov in coverages:
+            name = cov.get("name", "?")
+            lines.append(f"### {name}")
+            current = cov.get("current", {})
+            previous = cov.get("previous", {})
+            if current:
+                lines.append(f"  Current: {current}")
+            if previous:
+                lines.append(f"  Previous: {previous}")
+        lines.append("")
+
+    # Dynamic analysis
+    dyn = data.get("dynamicanalyses", [])
+    if dyn:
+        lines.append("## Dynamic Analysis")
+        for d in dyn:
+            lines.append(f"- {d.get('name', '?')}")
+        lines.append("")
+
+    # Static analysis
+    static = data.get("staticanalyses", [])
+    if static:
+        lines.append("## Static Analysis")
+        for s in static:
+            lines.append(f"- {s.get('name', '?')}")
+        lines.append("")
+
+    # Measurements
+    measurements = data.get("measurements", [])
+    if measurements:
+        lines.append("## Measurements")
+        for m in measurements:
+            lines.append(f"- {m.get('name', '?')}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Tool: get_coverage_comparison
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+async def get_coverage_comparison(
+    project: str,
+    date: str | None = None,
+    ctx: Context = None,
+) -> str:
+    """Compare code coverage across builds for a project. Useful for detecting coverage regressions.
+
+    Args:
+        project: CDash project name (e.g. "PublicDashboard").
+        date: Optional date (YYYY-MM-DD). Defaults to today.
+    """
+    client = _get_client(ctx)
+    try:
+        data = await client.get_coverage_comparison(project, date)
+    except CDashError as e:
+        return f"Error: {e}"
+
+    lines: list[str] = []
+    lines.append(f"# Coverage Comparison — {project}")
+    lines.append("")
+
+    total_records = data.get("iTotalRecords", 0)
+    total_display = data.get("iTotalDisplayRecords", 0)
+
+    lines.append(f"**Total files**: {total_records}")
+    if total_display != total_records:
+        lines.append(f"**Displayed**: {total_display}")
+    lines.append("")
+
+    rows = data.get("aaData", [])
+    if not rows:
+        lines.append("No coverage data found.")
+        return "\n".join(lines)
+
+    lines.append("## Files")
+    lines.append("")
+
+    # CDash returns rows as arrays: [filename, status, percentage, untested, ...]
+    for row in rows[:50]:
+        if len(row) >= 4:
+            filename = row[0]
+            # Strip HTML tags from filename
+            filename_clean = re.sub(r"<[^>]+>", "", str(filename)).strip()
+            status = re.sub(r"<[^>]+>", "", str(row[1])).strip()
+            pct = re.sub(r"<[^>]+>", "", str(row[2])).strip()
+            untested = re.sub(r"<[^>]+>", "", str(row[3])).strip()
+
+            lines.append(f"- `{filename_clean}`: {status} ({pct}) — {untested}")
+        else:
+            lines.append(f"- {row}")
+
+    if len(rows) > 50:
+        lines.append(f"\n... and {len(rows) - 50} more (showing first 50)")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Tool: get_dynamic_analysis
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+async def get_dynamic_analysis(
+    build_id: int,
+    ctx: Context = None,
+) -> str:
+    """Get dynamic analysis results (e.g. Valgrind, sanitizers) for a build.
+
+    Args:
+        build_id: The CDash build ID.
+    """
+    client = _get_client(ctx)
+    try:
+        data = await client.get_dynamic_analysis(build_id)
+    except CDashError as e:
+        return f"Error: {e}"
+
+    lines: list[str] = []
+    title = data.get("title", f"Dynamic Analysis (build_id={build_id})")
+    lines.append(f"# {title}")
+    lines.append("")
+
+    build = data.get("build", {})
+    if build:
+        lines.append(f"**Build**: {build.get('buildname', '?')}")
+        lines.append(f"**Site**: {build.get('site', '?')}")
+        lines.append(f"**Time**: {build.get('buildtime', '?')}")
+        lines.append("")
+
+    # Defect type legend
+    defect_types = data.get("defecttypes", [])
+    if defect_types:
+        type_names = [d.get("type", "?") for d in defect_types]
+        lines.append(f"**Defect types**: {', '.join(type_names)}")
+        lines.append("")
+
+    analyses = data.get("dynamicanalyses", [])
+    if not analyses:
+        lines.append("No dynamic analysis results found.")
+        return "\n".join(lines)
+
+    lines.append(f"## Results ({len(analyses)} tests)")
+    lines.append("")
+
+    # Show tests with defects first, then clean ones
+    with_defects = []
+    clean = 0
+    for a in analyses:
+        name = a.get("name", "?")
+        status = a.get("status", "?")
+        defects = a.get("defects", [])
+        try:
+            total_defects = sum(int(d) for d in defects)
+        except (ValueError, TypeError):
+            total_defects = 0
+
+        if total_defects > 0:
+            with_defects.append((name, status, defects, total_defects))
+        else:
+            clean += 1
+
+    for name, status, defects, total_defects in with_defects[:50]:
+        lines.append(f"- **{name}** [{status}] — {total_defects} defect(s)")
+
+    if clean:
+        lines.append(f"\n{clean} test(s) with no defects (clean)")
+
+    if len(with_defects) > 50:
+        lines.append(
+            f"... and {len(with_defects) - 50} more with defects (showing first 50)"
+        )
 
     return "\n".join(lines)
 

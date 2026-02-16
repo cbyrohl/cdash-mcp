@@ -196,3 +196,87 @@ class CDashClient:
             build_id: The CDash build ID.
         """
         return await self._get("/api/v1/viewConfigure.php", {"buildid": build_id})
+
+    async def _resolve_project_id(self, project_name: str) -> int:
+        """Resolve a project name to its numeric CDash ID.
+
+        Args:
+            project_name: Human-readable project name.
+        """
+        data = await self._get("/api/v1/index.php", {"project": project_name})
+        project_id = data.get("projectid")
+        if not project_id:
+            raise CDashNotFoundError(f"Project not found: {project_name}")
+        return int(project_id)
+
+    async def get_test_details(self, build_test_id: int) -> dict[str, Any]:
+        """Get detailed output/log for a single test run.
+
+        Args:
+            build_test_id: The CDash build-test ID (unique per test-in-build).
+        """
+        return await self._get(
+            "/api/v1/testDetails.php", {"buildtestid": build_test_id}
+        )
+
+    async def get_test_summary(
+        self, project: str, test_name: str, date: str | None = None
+    ) -> dict[str, Any]:
+        """Get summary of a test across builds (pass/fail history).
+
+        Args:
+            project: CDash project name.
+            test_name: Exact test name.
+            date: Optional date string (YYYY-MM-DD).
+        """
+        project_id = await self._resolve_project_id(project)
+        params: dict[str, Any] = {"project": project_id, "name": test_name}
+        if date:
+            params["date"] = date
+        return await self._get("/api/v1/testSummary.php", params)
+
+    async def get_build_update(self, build_id: int) -> dict[str, Any]:
+        """Get source code changes (VCS updates) associated with a build.
+
+        Args:
+            build_id: The CDash build ID.
+        """
+        return await self._get("/api/v1/viewUpdate.php", {"buildid": build_id})
+
+    async def get_project_overview(
+        self, project: str, date: str | None = None
+    ) -> dict[str, Any]:
+        """Get project overview with aggregate statistics.
+
+        Args:
+            project: CDash project name.
+            date: Optional date string (YYYY-MM-DD).
+        """
+        params: dict[str, Any] = {"project": project}
+        if date:
+            params["date"] = date
+        return await self._get("/api/v1/overview.php", params)
+
+    async def get_coverage_comparison(
+        self, project: str, date: str | None = None
+    ) -> dict[str, Any]:
+        """Compare code coverage across builds.
+
+        Args:
+            project: CDash project name.
+            date: Optional date string (YYYY-MM-DD).
+        """
+        params: dict[str, Any] = {"project": project}
+        if date:
+            params["date"] = date
+        return await self._get("/api/v1/compareCoverage.php", params)
+
+    async def get_dynamic_analysis(self, build_id: int) -> dict[str, Any]:
+        """Get dynamic analysis results (e.g. Valgrind) for a build.
+
+        Args:
+            build_id: The CDash build ID.
+        """
+        return await self._get(
+            "/api/v1/viewDynamicAnalysis.php", {"buildid": build_id}
+        )
