@@ -82,6 +82,11 @@ class CDashClient:
             )
         if resp.status_code == 404:
             raise CDashNotFoundError(f"Resource not found: {path}")
+        if resp.status_code >= 500:
+            raise CDashError(
+                f"CDash server error ({resp.status_code}) for {path}. "
+                "The server may be misconfigured or the requested data unavailable."
+            )
         resp.raise_for_status()
         return resp.json()
 
@@ -258,17 +263,23 @@ class CDashClient:
         return await self._get("/api/v1/overview.php", params)
 
     async def get_coverage_comparison(
-        self, project: str, date: str | None = None
+        self,
+        project: str,
+        date: str | None = None,
+        build_id: int | None = None,
     ) -> dict[str, Any]:
         """Compare code coverage across builds.
 
         Args:
             project: CDash project name.
             date: Optional date string (YYYY-MM-DD).
+            build_id: Optional build ID to get coverage for a specific build.
         """
         params: dict[str, Any] = {"project": project}
         if date:
             params["date"] = date
+        if build_id is not None:
+            params["buildid"] = build_id
         return await self._get("/api/v1/compareCoverage.php", params)
 
     async def get_dynamic_analysis(self, build_id: int) -> dict[str, Any]:

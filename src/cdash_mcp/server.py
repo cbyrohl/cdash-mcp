@@ -741,6 +741,7 @@ async def get_project_overview(
 async def get_coverage_comparison(
     project: str,
     date: str | None = None,
+    build_id: int | None = None,
     ctx: Context = None,
 ) -> str:
     """Compare code coverage across builds for a project. Useful for detecting coverage regressions.
@@ -748,10 +749,11 @@ async def get_coverage_comparison(
     Args:
         project: CDash project name (e.g. "PublicDashboard").
         date: Optional date (YYYY-MM-DD). Defaults to today.
+        build_id: Optional build ID to get coverage for a specific build.
     """
     client = _get_client(ctx)
     try:
-        data = await client.get_coverage_comparison(project, date)
+        data = await client.get_coverage_comparison(project, date, build_id)
     except CDashError as e:
         return f"Error: {e}"
 
