@@ -750,6 +750,8 @@ async def get_coverage_comparison(
         project: CDash project name (e.g. "PublicDashboard").
         date: Optional date (YYYY-MM-DD). Defaults to today.
         build_id: Optional build ID to get coverage for a specific build.
+            Recommended: provide a build_id from the dashboard for reliable results.
+            Without build_id, uses cross-build comparison (only works for Nightly builds).
     """
     client = _get_client(ctx)
     try:

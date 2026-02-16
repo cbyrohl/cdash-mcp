@@ -278,16 +278,22 @@ class CDashClient:
     ) -> dict[str, Any]:
         """Compare code coverage across builds.
 
+        Uses /ajax/getviewcoverage.php for per-build coverage when build_id is
+        provided (works for all build types), and falls back to
+        /api/v1/compareCoverage.php for cross-build comparison (Nightly only).
+
         Args:
             project: CDash project name.
             date: Optional date string (YYYY-MM-DD).
             build_id: Optional build ID to get coverage for a specific build.
         """
+        if build_id is not None:
+            return await self._get(
+                "/ajax/getviewcoverage.php", {"buildid": build_id}
+            )
         params: dict[str, Any] = {"project": project}
         if date:
             params["date"] = date
-        if build_id is not None:
-            params["buildid"] = build_id
         return await self._get("/api/v1/compareCoverage.php", params)
 
     async def get_dynamic_analysis(self, build_id: int) -> dict[str, Any]:
