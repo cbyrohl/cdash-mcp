@@ -6,7 +6,6 @@ import pytest_asyncio
 from cdash_mcp.client import (
     CDashClient,
     CDashConnectionError,
-    CDashNotFoundError,
 )
 
 PROJECT = "PublicDashboard"

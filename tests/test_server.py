@@ -1,11 +1,9 @@
 """MCP tool tests using in-process memory streams. [AI-Claude]"""
 
-import pytest
 import anyio
-
+import pytest
 from mcp.client.session import ClientSession
 from mcp.shared.message import SessionMessage
-
 
 PROJECT = "PublicDashboard"
 

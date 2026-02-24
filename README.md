@@ -1,73 +1,39 @@
 # cdash-mcp
 
-MCP server for querying [Kitware CDash](https://www.cdash.org/) CI/CD build and test results.
+![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue)
+![License: MIT](https://img.shields.io/badge/license-MIT-green)
 
-Lets AI assistants (Claude Code, Claude Desktop) browse dashboards, find failing tests, and inspect build errors from any CDash instance.
+An [MCP](https://modelcontextprotocol.io/) server for [Kitware CDash](https://www.cdash.org/) — the CI/CD dashboard for projects built with CMake/CTest. Browse dashboards, find failing tests, inspect build errors, check coverage, and triage CI failures, all through natural language. Works with Claude Desktop/Code, Cursor, and any MCP-compatible client.
 
-## Install
+Provides 12 tools for navigating CDash builds, tests, coverage, and dynamic analysis.
+
+## Quick Start
+
+### Prerequisites
+
+- Python 3.12+
+- A CDash instance (defaults to [open.cdash.org](https://open.cdash.org))
+
+### Installation
 
 ```bash
-git clone https://github.com/cbyrohl/cdash-mcp.git && cd cdash-mcp
-uv sync
+# Install from GitHub with uv (recommended)
+uv tool install git+https://github.com/cbyrohl/cdash-mcp
+
+# Or with pip
+pip install git+https://github.com/cbyrohl/cdash-mcp
 ```
 
-## Configuration
-
-| Environment variable | Default | Description |
-|---|---|---|
-| `CDASH_URL` | `https://open.cdash.org` | CDash instance URL |
-| `CDASH_TOKEN` | _(none)_ | Bearer token for authentication (required for private instances) |
-
-> **Note:** Project names in CDash are case-sensitive (e.g. `"thor"` and `"THOR"` are different projects).
-
-## Usage
-
 ### Claude Code
-
-The easiest way to add the server:
 
 ```bash
 claude mcp add cdash \
   -e CDASH_URL=https://open.cdash.org \
   -e CDASH_TOKEN=your-token-here \
-  -- uv --directory /path/to/cdash-mcp run cdash-mcp
+  -- uvx --from git+https://github.com/cbyrohl/cdash-mcp cdash-mcp
 ```
 
-This writes the config to `~/.claude.json`, which is where Claude Code reads MCP server definitions from.
-
-Alternatively, add the JSON manually to `~/.claude.json` (**not** `~/.claude/settings.json` — env vars will be silently ignored there):
-
-```json
-{
-  "mcpServers": {
-    "cdash": {
-      "command": "uv",
-      "args": ["--directory", "/path/to/cdash-mcp", "run", "cdash-mcp"],
-      "env": {
-        "CDASH_URL": "https://open.cdash.org",
-        "CDASH_TOKEN": "your-token-here"
-      }
-    }
-  }
-}
-```
-
-You can also use a project-scoped `.mcp.json` in your repo root, which supports environment variable expansion:
-
-```json
-{
-  "mcpServers": {
-    "cdash": {
-      "command": "uv",
-      "args": ["--directory", "/path/to/cdash-mcp", "run", "cdash-mcp"],
-      "env": {
-        "CDASH_URL": "${CDASH_URL:-https://open.cdash.org}",
-        "CDASH_TOKEN": "${CDASH_TOKEN}"
-      }
-    }
-  }
-}
-```
+Use `--scope user` for global access, `--scope project` to share via `.mcp.json` in your repo, or omit `--scope` for local (current project only).
 
 ### Claude Desktop
 
@@ -77,8 +43,8 @@ Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_
 {
   "mcpServers": {
     "cdash": {
-      "command": "uv",
-      "args": ["--directory", "/path/to/cdash-mcp", "run", "cdash-mcp"],
+      "command": "uvx",
+      "args": ["--from", "git+https://github.com/cbyrohl/cdash-mcp", "cdash-mcp"],
       "env": {
         "CDASH_URL": "https://open.cdash.org",
         "CDASH_TOKEN": "your-token-here"
@@ -88,23 +54,59 @@ Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_
 }
 ```
 
-### MCP Inspector (manual testing)
+### Running from Source
 
 ```bash
-CDASH_URL=https://open.cdash.org CDASH_TOKEN=your-token-here \
-  npx @modelcontextprotocol/inspector uv run cdash-mcp
+git clone https://github.com/cbyrohl/cdash-mcp.git
+cd cdash-mcp
+uv sync
+
+# Run the server
+uv run cdash-mcp
 ```
 
-## Tools
+## Configuration
+
+| Environment Variable | Required | Default | Description |
+|---------------------|----------|---------|-------------|
+| `CDASH_URL` | No | `https://open.cdash.org` | CDash instance URL |
+| `CDASH_TOKEN` | No | — | Bearer token for authentication (required for private instances) |
+
+> **Note:** Project names in CDash are case-sensitive (e.g. `"thor"` and `"THOR"` are different projects).
+
+## Tools (12)
+
+### Dashboard & Overview
 
 | Tool | Description |
-|---|---|
+|------|-------------|
 | `get_dashboard` | Dashboard overview: build groups, pass/fail counts, build IDs |
-| `get_failing_tests` | Non-passing tests across all builds (CI triage) |
+| `get_project_overview` | Aggregate build/test/coverage statistics for a project |
+
+### Test Triage
+
+| Tool | Description |
+|------|-------------|
+| `get_failing_tests` | Find non-passing tests across all builds (CI triage entry point) |
+| `get_build_tests` | List tests for a specific build, filter by passed/failed/notrun |
+| `get_test_details` | Detailed output/log for a single test run |
+| `get_test_summary` | Test pass/fail history across builds — detect flaky tests |
+
+### Build Inspection
+
+| Tool | Description |
+|------|-------------|
 | `get_build_details` | Drill into a build: configure/compile/test summary |
-| `get_build_errors` | Compiler errors/warnings with source file:line |
-| `get_build_tests` | List tests for a build, filter by passed/failed/notrun |
+| `get_build_errors` | Compiler errors or warnings with source file and line info |
 | `get_configure_output` | CMake configure command and output |
+| `get_build_update` | Source code changes (VCS commits) associated with a build |
+
+### Coverage & Analysis
+
+| Tool | Description |
+|------|-------------|
+| `get_coverage_comparison` | Compare code coverage across builds, detect regressions |
+| `get_dynamic_analysis` | Dynamic analysis results (Valgrind, sanitizers) |
 
 ## Troubleshooting
 
@@ -119,9 +121,19 @@ CDASH_URL=https://open.cdash.org CDASH_TOKEN=your-token-here \
 ## Development
 
 ```bash
+# Install dev dependencies
+uv sync
+
 # Run tests (hits open.cdash.org live)
 uv run pytest tests/ -v
 
-# Start server locally
+# Lint
+uv run ruff check src/ tests/
+
+# Run the server locally
 uv run cdash-mcp
 ```
+
+## License
+
+MIT

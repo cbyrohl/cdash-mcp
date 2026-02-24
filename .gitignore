@@ -1,13 +1,19 @@
-# Python-generated files
 __pycache__/
-*.py[oc]
-build/
+*.py[cod]
+*$py.class
+*.egg-info/
 dist/
-wheels/
-*.egg-info
-
-# Virtual environments
-.venv
-
-# Claude Code local settings (may contain tokens)
+build/
+.eggs/
+*.egg
+.venv/
+venv/
+.env
+.pytest_cache/
+.ruff_cache/
+*.so
+.coverage
+htmlcov/
+.idea/
+.vscode/
 .claude/
