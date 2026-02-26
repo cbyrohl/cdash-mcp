@@ -128,6 +128,8 @@ async def get_failing_tests(
     project: str,
     date: str | None = None,
     test_name: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
     ctx: Context = None,
 ) -> str:
     """Find non-passing tests across all builds for a project. Most useful for CI triage.
@@ -136,12 +138,17 @@ async def get_failing_tests(
         project: CDash project name (e.g. "PublicDashboard").
         date: Optional date (YYYY-MM-DD). Defaults to today.
         test_name: Optional filter to match test names containing this string.
+        limit: Maximum number of tests to return (default 50, max 200).
+        offset: Number of tests to skip (default 0). Use for pagination.
     """
     client = _get_client(ctx)
     try:
         data = await client.query_tests(project, date, test_name)
     except CDashError as e:
         return f"Error: {e}"
+
+    limit = max(1, min(limit, 200))
+    offset = max(0, offset)
 
     lines: list[str] = []
     lines.append(f"# Failing Tests for {project}")
@@ -152,11 +159,23 @@ async def get_failing_tests(
         lines.append("No failing tests found.")
         return "\n".join(lines)
 
-    lines.append(f"Found {len(tests)} non-passing test result(s):")
+    total = len(tests)
+    page = tests[offset : offset + limit]
+
+    if not page:
+        lines.append(
+            f"Found {total} non-passing test result(s)"
+            f" — no results in this range (offset={offset})."
+        )
+        return "\n".join(lines)
+
+    lines.append(
+        f"Found {total} non-passing test result(s)"
+        f" (showing {offset + 1}–{offset + len(page)}):"
+    )
     lines.append("")
 
-    # Cap at 50 results
-    for t in tests[:50]:
+    for t in page:
         test_name_val = t.get("testname", "?")
         status = t.get("status", "?")
         build_name = t.get("buildName", "?")
@@ -173,8 +192,9 @@ async def get_failing_tests(
             lines.append(f"  Details: {details}")
         lines.append("")
 
-    if len(tests) > 50:
-        lines.append(f"... and {len(tests) - 50} more results (showing first 50)")
+    remaining = total - offset - len(page)
+    if remaining > 0:
+        lines.append(f"... {remaining} more (use offset={offset + limit} to see next page)")
 
     return "\n".join(lines)
 
@@ -265,6 +285,8 @@ async def get_build_details(
 async def get_build_errors(
     build_id: int,
     warnings: bool = False,
+    limit: int = 30,
+    offset: int = 0,
     ctx: Context = None,
 ) -> str:
     """View compiler errors or warnings for a build, with source file and line info.
@@ -272,12 +294,17 @@ async def get_build_errors(
     Args:
         build_id: The CDash build ID.
         warnings: If True, show warnings instead of errors.
+        limit: Maximum number of errors to return (default 30, max 200).
+        offset: Number of errors to skip (default 0). Use for pagination.
     """
     client = _get_client(ctx)
     try:
         data = await client.get_build_errors(build_id, warnings=warnings)
     except CDashError as e:
         return f"Error: {e}"
+
+    limit = max(1, min(limit, 200))
+    offset = max(0, offset)
 
     label = "Warnings" if warnings else "Errors"
     lines: list[str] = []
@@ -289,11 +316,17 @@ async def get_build_errors(
         lines.append(f"No {label.lower()} found.")
         return "\n".join(lines)
 
-    lines.append(f"Found {len(errors)} {label.lower()}:")
+    total = len(errors)
+    page = errors[offset : offset + limit]
+
+    if not page:
+        lines.append(f"Found {total} {label.lower()} — no results in this range (offset={offset}).")
+        return "\n".join(lines)
+
+    lines.append(f"Found {total} {label.lower()} (showing {offset + 1}–{offset + len(page)}):")
     lines.append("")
 
-    # Cap at 30 errors
-    for err in errors[:30]:
+    for err in page:
         source_file = err.get("sourcefile", "")
         source_line = err.get("sourceline", "")
         text = err.get("text", "").strip()
@@ -317,8 +350,9 @@ async def get_build_errors(
             lines.append(f"```\n{postcontext}\n```")
         lines.append("")
 
-    if len(errors) > 30:
-        lines.append(f"... and {len(errors) - 30} more (showing first 30)")
+    remaining = total - offset - len(page)
+    if remaining > 0:
+        lines.append(f"... {remaining} more (use offset={offset + limit} to see next page)")
 
     return "\n".join(lines)
 
@@ -332,6 +366,8 @@ async def get_build_errors(
 async def get_build_tests(
     build_id: int,
     status_filter: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
     ctx: Context = None,
 ) -> str:
     """List tests for a specific build, optionally filtered by status.
@@ -339,12 +375,17 @@ async def get_build_tests(
     Args:
         build_id: The CDash build ID.
         status_filter: Optional filter: "passed", "failed", or "notrun".
+        limit: Maximum number of tests to return (default 50, max 200).
+        offset: Number of tests to skip (default 0). Use for pagination.
     """
     client = _get_client(ctx)
     try:
         data = await client.get_build_tests(build_id, status_filter)
     except CDashError as e:
         return f"Error: {e}"
+
+    limit = max(1, min(limit, 200))
+    offset = max(0, offset)
 
     lines: list[str] = []
     filter_label = f" ({status_filter})" if status_filter else ""
@@ -356,11 +397,17 @@ async def get_build_tests(
         lines.append("No tests found.")
         return "\n".join(lines)
 
-    lines.append(f"Found {len(tests)} test(s):")
+    total = len(tests)
+    page = tests[offset : offset + limit]
+
+    if not page:
+        lines.append(f"Found {total} test(s) — no results in this range (offset={offset}).")
+        return "\n".join(lines)
+
+    lines.append(f"Found {total} test(s) (showing {offset + 1}–{offset + len(page)}):")
     lines.append("")
 
-    # Cap at 50
-    for t in tests[:50]:
+    for t in page:
         name = t.get("name", "?")
         status = t.get("status", "?")
         exec_time = t.get("execTime", "?")
@@ -379,8 +426,9 @@ async def get_build_tests(
             line += f" — {details}"
         lines.append(line)
 
-    if len(tests) > 50:
-        lines.append(f"\n... and {len(tests) - 50} more (showing first 50)")
+    remaining = total - offset - len(page)
+    if remaining > 0:
+        lines.append(f"\n... {remaining} more (use offset={offset + limit} to see next page)")
 
     return "\n".join(lines)
 
@@ -507,6 +555,8 @@ async def get_test_summary(
     project: str,
     test_name: str,
     date: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
     ctx: Context = None,
 ) -> str:
     """Get summary of a test across builds — shows pass/fail history to detect flaky tests.
@@ -515,12 +565,17 @@ async def get_test_summary(
         project: CDash project name (e.g. "PublicDashboard").
         test_name: Exact name of the test.
         date: Optional date (YYYY-MM-DD). Defaults to today.
+        limit: Maximum number of builds to return (default 50, max 200).
+        offset: Number of builds to skip (default 0). Use for pagination.
     """
     client = _get_client(ctx)
     try:
         data = await client.get_test_summary(project, test_name, date)
     except CDashError as e:
         return f"Error: {e}"
+
+    limit = max(1, min(limit, 200))
+    offset = max(0, offset)
 
     lines: list[str] = []
     lines.append(f"# Test Summary: {test_name}")
@@ -540,10 +595,20 @@ async def get_test_summary(
         lines.append("No build results found.")
         return "\n".join(lines)
 
-    lines.append(f"## Results across {len(builds)} build(s):")
+    total = len(builds)
+    page = builds[offset : offset + limit]
+
+    if not page:
+        lines.append(
+            f"Results across {total} build(s)"
+            f" — no results in this range (offset={offset})."
+        )
+        return "\n".join(lines)
+
+    lines.append(f"## Results across {total} build(s) (showing {offset + 1}–{offset + len(page)}):")
     lines.append("")
 
-    for b in builds[:50]:
+    for b in page:
         site = b.get("site", "?")
         build_name = b.get("buildName", "?")
         status = b.get("status", "?")
@@ -563,8 +628,9 @@ async def get_test_summary(
             line += f" rev={update['revision'][:12]}"
         lines.append(line)
 
-    if len(builds) > 50:
-        lines.append(f"\n... and {len(builds) - 50} more (showing first 50)")
+    remaining = total - offset - len(page)
+    if remaining > 0:
+        lines.append(f"\n... {remaining} more (use offset={offset + limit} to see next page)")
 
     return "\n".join(lines)
 
@@ -742,6 +808,8 @@ async def get_coverage_comparison(
     project: str,
     date: str | None = None,
     build_id: int | None = None,
+    limit: int = 50,
+    offset: int = 0,
     ctx: Context = None,
 ) -> str:
     """Compare code coverage across builds for a project. Useful for detecting coverage regressions.
@@ -752,12 +820,17 @@ async def get_coverage_comparison(
         build_id: Optional build ID to get coverage for a specific build.
             Recommended: provide a build_id from the dashboard for reliable results.
             Without build_id, uses cross-build comparison (only works for Nightly builds).
+        limit: Maximum number of files to return (default 50, max 200).
+        offset: Number of files to skip (default 0). Use for pagination.
     """
     client = _get_client(ctx)
     try:
         data = await client.get_coverage_comparison(project, date, build_id)
     except CDashError as e:
         return f"Error: {e}"
+
+    limit = max(1, min(limit, 200))
+    offset = max(0, offset)
 
     lines: list[str] = []
     lines.append(f"# Coverage Comparison — {project}")
@@ -776,11 +849,18 @@ async def get_coverage_comparison(
         lines.append("No coverage data found.")
         return "\n".join(lines)
 
-    lines.append("## Files")
+    total = len(rows)
+    page = rows[offset : offset + limit]
+
+    if not page:
+        lines.append(f"## Files ({total} total) — no results in this range (offset={offset}).")
+        return "\n".join(lines)
+
+    lines.append(f"## Files ({total} total, showing {offset + 1}–{offset + len(page)})")
     lines.append("")
 
     # CDash returns rows as arrays: [filename, status, percentage, untested, ...]
-    for row in rows[:50]:
+    for row in page:
         if len(row) >= 4:
             filename = row[0]
             # Strip HTML tags from filename
@@ -793,8 +873,9 @@ async def get_coverage_comparison(
         else:
             lines.append(f"- {row}")
 
-    if len(rows) > 50:
-        lines.append(f"\n... and {len(rows) - 50} more (showing first 50)")
+    remaining = total - offset - len(page)
+    if remaining > 0:
+        lines.append(f"\n... {remaining} more (use offset={offset + limit} to see next page)")
 
     return "\n".join(lines)
 
@@ -807,18 +888,25 @@ async def get_coverage_comparison(
 @mcp.tool()
 async def get_dynamic_analysis(
     build_id: int,
+    limit: int = 50,
+    offset: int = 0,
     ctx: Context = None,
 ) -> str:
     """Get dynamic analysis results (e.g. Valgrind, sanitizers) for a build.
 
     Args:
         build_id: The CDash build ID.
+        limit: Maximum number of defect entries to return (default 50, max 200).
+        offset: Number of defect entries to skip (default 0). Use for pagination.
     """
     client = _get_client(ctx)
     try:
         data = await client.get_dynamic_analysis(build_id)
     except CDashError as e:
         return f"Error: {e}"
+
+    limit = max(1, min(limit, 200))
+    offset = max(0, offset)
 
     lines: list[str] = []
     title = data.get("title", f"Dynamic Analysis (build_id={build_id})")
@@ -864,16 +952,26 @@ async def get_dynamic_analysis(
         else:
             clean += 1
 
-    for name, status, defects, total_defects in with_defects[:50]:
-        lines.append(f"- **{name}** [{status}] — {total_defects} defect(s)")
+    total = len(with_defects)
+    page = with_defects[offset : offset + limit]
+
+    if not page and total > 0:
+        lines.append(f"{total} test(s) with defects — no results in this range (offset={offset}).")
+    elif page:
+        lines.append(f"Showing defects {offset + 1}–{offset + len(page)} of {total}:")
+        lines.append("")
+        for name, status, defects, total_defects in page:
+            lines.append(f"- **{name}** [{status}] — {total_defects} defect(s)")
+
+        remaining = total - offset - len(page)
+        if remaining > 0:
+            lines.append(
+                f"\n... {remaining} more with defects"
+                f" (use offset={offset + limit} to see next page)"
+            )
 
     if clean:
         lines.append(f"\n{clean} test(s) with no defects (clean)")
-
-    if len(with_defects) > 50:
-        lines.append(
-            f"... and {len(with_defects) - 50} more with defects (showing first 50)"
-        )
 
     return "\n".join(lines)
 

@@ -97,6 +97,52 @@ async def test_get_failing_tests_tool():
 
 
 @pytest.mark.anyio
+async def test_get_build_tests_pagination():
+    """get_build_tests respects limit and offset parameters. [AI]"""
+
+    async def check(client):
+        # First, get the dashboard to find a build with tests
+        dash = await client.call_tool(
+            "get_dashboard", {"project": PROJECT}
+        )
+        assert not dash.isError
+        text = dash.content[0].text
+        # Extract a build_id from dashboard output
+        import re
+        ids = re.findall(r"id=(\d+)", text)
+        assert ids, "No builds found on dashboard"
+        build_id = int(ids[0])
+
+        # Fetch first page with limit=2
+        page1 = await client.call_tool(
+            "get_build_tests",
+            {"build_id": build_id, "limit": 2, "offset": 0},
+        )
+        assert not page1.isError
+        text1 = page1.content[0].text
+
+        # Fetch second page with limit=2, offset=2
+        page2 = await client.call_tool(
+            "get_build_tests",
+            {"build_id": build_id, "limit": 2, "offset": 2},
+        )
+        assert not page2.isError
+        text2 = page2.content[0].text
+
+        # Both should mention the build, but show different ranges
+        assert f"build {build_id}" in text1
+        assert f"build {build_id}" in text2
+
+        # If there are tests, page 1 should show "1–" and page 2 "3–"
+        if "No tests found" not in text1:
+            assert "showing 1\u2013" in text1
+        if "No tests found" not in text2 and "no results in this range" not in text2:
+            assert "showing 3\u2013" in text2
+
+    await _run_with_client(check)
+
+
+@pytest.mark.anyio
 async def test_get_dashboard_invalid_project():
     """get_dashboard with invalid project returns graceful response. [AI]"""
 
