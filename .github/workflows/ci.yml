@@ -25,3 +25,5 @@ jobs:
         run: uv run ruff check src/ tests/
       - name: Test
         run: uv run pytest tests/ -v
+        env:
+          CDASH_URL: https://open.cdash.org
