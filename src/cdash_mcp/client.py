@@ -31,13 +31,13 @@ class CDashClient:
     """Async client for the CDash REST API.
 
     Args:
-        base_url: CDash instance URL. Defaults to CDASH_URL env var or open.cdash.org.
+        base_url: CDash instance URL. Defaults to CDASH_URL env var or my.cdash.org.
         token: API token for auth. Defaults to CDASH_TOKEN env var.
     """
 
     base_url: str = field(
         default_factory=lambda: os.environ.get(
-            "CDASH_URL", "https://open.cdash.org"
+            "CDASH_URL", "https://my.cdash.org"
         ).rstrip("/")
     )
     token: str | None = field(

@@ -12,7 +12,7 @@ Provides 12 tools for navigating CDash builds, tests, coverage, and dynamic anal
 ### Prerequisites
 
 - Python 3.12+
-- A CDash instance (defaults to [open.cdash.org](https://open.cdash.org))
+- A CDash instance (defaults to [my.cdash.org](https://my.cdash.org))
 
 ### Installation
 
@@ -28,7 +28,7 @@ pip install git+https://github.com/cbyrohl/cdash-mcp
 
 ```bash
 claude mcp add cdash \
-  -e CDASH_URL=https://open.cdash.org \
+  -e CDASH_URL=https://my.cdash.org \
   -e CDASH_TOKEN=your-token-here \
   -- uvx --from git+https://github.com/cbyrohl/cdash-mcp cdash-mcp
 ```
@@ -46,7 +46,7 @@ Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_
       "command": "uvx",
       "args": ["--from", "git+https://github.com/cbyrohl/cdash-mcp", "cdash-mcp"],
       "env": {
-        "CDASH_URL": "https://open.cdash.org",
+        "CDASH_URL": "https://my.cdash.org",
         "CDASH_TOKEN": "your-token-here"
       }
     }
@@ -69,7 +69,7 @@ uv run cdash-mcp
 
 | Environment Variable | Required | Default | Description |
 |---------------------|----------|---------|-------------|
-| `CDASH_URL` | No | `https://open.cdash.org` | CDash instance URL |
+| `CDASH_URL` | No | `https://my.cdash.org` | CDash instance URL |
 | `CDASH_TOKEN` | No | — | Bearer token for authentication (required for private instances) |
 
 > **Note:** Project names in CDash are case-sensitive (e.g. `"thor"` and `"THOR"` are different projects).
@@ -124,7 +124,7 @@ uv run cdash-mcp
 # Install dev dependencies
 uv sync
 
-# Run tests (hits open.cdash.org live)
+# Run tests (hits my.cdash.org live)
 uv run pytest tests/ -v
 
 # Lint
