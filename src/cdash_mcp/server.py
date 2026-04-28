@@ -488,61 +488,19 @@ async def get_configure_output(
 
 
 # ---------------------------------------------------------------------------
-# Tool: get_test_details
+# (Removed) get_test_details
+#
+# CDash's REST API has no endpoint that returns a test's command/stdout/log
+# as JSON. /api/v1/testDetails.php is a binary file-download endpoint for
+# CTest ATTACHED_FILES measurements only, and the modern frontend reads
+# command/output via GraphQL — which on my.cdash.org accepts only Sanctum
+# session cookies, not Bearer tokens. Removed in favour of returning an
+# honest "not supported" rather than a misleading tool. To pull logs:
+#   1. attach them via CTest ATTACHED_FILES_ON_FAIL, then download
+#      /api/v1/testDetails.php?buildtestid=<id>&fileid=<n>, or
+#   2. drive /graphql with a browser session cookie, or
+#   3. make the project public so unauthenticated GraphQL works.
 # ---------------------------------------------------------------------------
-
-
-@mcp.tool()
-async def get_test_details(
-    build_test_id: int,
-    ctx: Context = None,
-) -> str:
-    """Get detailed output/log for a single test run.
-
-    Args:
-        build_test_id: The CDash build-test ID (from get_build_tests results).
-    """
-    client = _get_client(ctx)
-    try:
-        data = await client.get_test_details(build_test_id)
-    except CDashError as e:
-        return f"Error: {e}"
-
-    lines: list[str] = []
-
-    test = data.get("test", {})
-    test_name = test.get("test", test.get("name", "?"))
-    status = test.get("status", "?")
-    command = test.get("command", "")
-    output = test.get("output", "")
-
-    lines.append(f"# Test Details: {test_name}")
-    lines.append(f"**Status**: {status}")
-    lines.append(f"**Build-Test ID**: {build_test_id}")
-    lines.append("")
-
-    if command:
-        lines.append("**Command**:")
-        lines.append(f"```\n{command}\n```")
-        lines.append("")
-
-    # Measurements
-    measurements = test.get("measurements", [])
-    if measurements:
-        lines.append("## Measurements")
-        for m in measurements:
-            name = m.get("name", "?")
-            value = m.get("value", "?")
-            lines.append(f"- **{name}**: {value}")
-        lines.append("")
-
-    if output:
-        if len(output) > 8000:
-            output = output[:8000] + "\n... (truncated, showing first 8000 chars)"
-        lines.append("## Output")
-        lines.append(f"```\n{output}\n```")
-
-    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------

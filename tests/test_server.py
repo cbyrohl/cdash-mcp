@@ -42,7 +42,7 @@ async def _run_with_client(fn):
 
 @pytest.mark.anyio
 async def test_list_tools():
-    """Server exposes all 12 tools. [AI]"""
+    """Server exposes all 11 tools. [AI]"""
 
     async def check(client):
         result = await client.list_tools()
@@ -54,7 +54,6 @@ async def test_list_tools():
             "get_build_errors",
             "get_build_tests",
             "get_configure_output",
-            "get_test_details",
             "get_test_summary",
             "get_build_update",
             "get_project_overview",

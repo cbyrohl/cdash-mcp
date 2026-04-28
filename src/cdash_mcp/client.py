@@ -62,6 +62,26 @@ class CDashClient:
             await self._client.aclose()
             self._client = None
 
+    @staticmethod
+    def _extract_error(resp: httpx.Response) -> str:
+        """Pull a useful error message out of a CDash response body.
+
+        CDash returns ``{"error": "...", "code": NNN}`` JSON on most error
+        paths; fall back to a clipped raw body when the response isn't JSON.
+        """
+        try:
+            body = resp.json()
+        except ValueError:
+            body = None
+        if isinstance(body, dict) and "error" in body:
+            msg = str(body["error"]).strip()
+            if msg:
+                return msg
+        text = resp.text.strip()
+        if not text:
+            return "(empty body)"
+        return text if len(text) <= 500 else text[:500] + "…"
+
     async def _get(self, path: str, params: dict[str, Any] | None = None) -> Any:
         """Make a GET request to the CDash API and return parsed JSON."""
         assert self._client is not None, "Client not initialized. Use 'async with'."
@@ -78,20 +98,24 @@ class CDashClient:
 
         if resp.status_code in (401, 403):
             raise CDashAuthError(
-                f"Authentication failed ({resp.status_code}). "
+                f"Authentication failed ({resp.status_code}) for {path}: "
+                f"{self._extract_error(resp)}. "
                 "Check your CDASH_TOKEN environment variable."
             )
         if resp.status_code == 400:
             raise CDashError(
-                f"Bad request for {path}. "
-                "Check that all required parameters are provided."
+                f"Bad request ({resp.status_code}) for {path}: "
+                f"{self._extract_error(resp)}"
             )
         if resp.status_code == 404:
-            raise CDashNotFoundError(f"Resource not found: {path}")
+            raise CDashNotFoundError(
+                f"Resource not found ({resp.status_code}) for {path}: "
+                f"{self._extract_error(resp)}"
+            )
         if resp.status_code >= 500:
             raise CDashError(
-                f"CDash server error ({resp.status_code}) for {path}. "
-                "The server may be misconfigured or the requested data unavailable."
+                f"CDash server error ({resp.status_code}) for {path}: "
+                f"{self._extract_error(resp)}"
             )
         resp.raise_for_status()
         return resp.json()
@@ -219,16 +243,6 @@ class CDashClient:
         if not project_id:
             raise CDashNotFoundError(f"Project not found: {project_name}")
         return int(project_id)
-
-    async def get_test_details(self, build_test_id: int) -> dict[str, Any]:
-        """Get detailed output/log for a single test run.
-
-        Args:
-            build_test_id: The CDash build-test ID (unique per test-in-build).
-        """
-        return await self._get(
-            "/api/v1/testDetails.php", {"buildtestid": build_test_id}
-        )
 
     async def get_test_summary(
         self, project: str, test_name: str, date: str | None = None

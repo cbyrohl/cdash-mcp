@@ -89,7 +89,6 @@ uv run cdash-mcp
 |------|-------------|
 | `get_failing_tests` | Find non-passing tests across all builds (CI triage entry point) |
 | `get_build_tests` | List tests for a specific build, filter by passed/failed/notrun |
-| `get_test_details` | Detailed output/log for a single test run |
 | `get_test_summary` | Test pass/fail history across builds — detect flaky tests |
 
 ### Build Inspection
