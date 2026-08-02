@@ -441,12 +441,17 @@ async def get_build_tests(
 @mcp.tool()
 async def get_configure_output(
     build_id: int,
+    output_offset: int = 0,
+    output_limit: int = 34816,
     ctx: Context = None,
 ) -> str:
     """View CMake configure command and output for a build.
 
     Args:
         build_id: The CDash build ID.
+        output_offset: Character offset into the configure output (default 0).
+        output_limit: Maximum characters of output to return (default 34816 = 34 KB).
+            Set to 0 for no limit.
     """
     client = _get_client(ctx)
     try:
@@ -478,10 +483,19 @@ async def get_configure_output(
             lines.append("")
 
         if output:
-            # Truncate very long output
-            if len(output) > 5000:
-                output = output[:5000] + "\n... (truncated, showing first 5000 chars)"
-            lines.append("**Output**:")
+            total_len = len(output)
+            if output_limit > 0:
+                output = output[output_offset : output_offset + output_limit]
+            elif output_offset > 0:
+                output = output[output_offset:]
+            lines.append(f"**Output** ({total_len} chars total):")
+            if output_offset > 0 or (
+                output_limit > 0 and output_offset + output_limit < total_len
+            ):
+                lines.append(
+                    f"*Showing chars {output_offset}–{output_offset + len(output)} "
+                    f"of {total_len}*"
+                )
             lines.append(f"```\n{output}\n```")
 
     return "\n".join(lines)
