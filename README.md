@@ -3,9 +3,9 @@
 ![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue)
 ![License: MIT](https://img.shields.io/badge/license-MIT-green)
 
-An [MCP](https://modelcontextprotocol.io/) server for [Kitware CDash](https://www.cdash.org/) — the CI/CD dashboard for projects built with CMake/CTest. Browse dashboards, find failing tests, inspect build errors, check coverage, and triage CI failures, all through natural language. Works with Claude Desktop/Code, Cursor, and any MCP-compatible client.
+An [MCP](https://modelcontextprotocol.io/) server for [Kitware CDash](https://www.cdash.org/) — the CI/CD dashboard for projects built with CMake/CTest. Browse dashboards, find failing tests, inspect build errors, check coverage, and triage CI failures, all through natural language. Works with OpenAI Codex, Claude Desktop/Code, Cursor, and any MCP-compatible client.
 
-Provides 12 tools for navigating CDash builds, tests, coverage, and dynamic analysis.
+Provides 11 tools for navigating CDash builds, tests, coverage, and dynamic analysis.
 
 ## Quick Start
 
@@ -23,6 +23,38 @@ uv tool install git+https://github.com/cbyrohl/cdash-mcp
 # Or with pip
 pip install git+https://github.com/cbyrohl/cdash-mcp
 ```
+
+### OpenAI Codex
+
+Add the server to Codex with the CLI:
+
+```bash
+codex mcp add cdash \
+  --env CDASH_URL=https://my.cdash.org \
+  --env CDASH_TOKEN=your-token-here \
+  -- uvx --from git+https://github.com/cbyrohl/cdash-mcp cdash-mcp
+
+# Confirm that Codex stored the configuration
+codex mcp list
+```
+
+The Codex CLI, IDE extension, and ChatGPT desktop app share this MCP configuration. Omit the `CDASH_TOKEN` option for public instances. Start a new Codex session after adding the server, then use `/mcp` to inspect its tools.
+
+For project-scoped configuration, export your credentials and add this to `.codex/config.toml` in a trusted repository:
+
+```bash
+export CDASH_URL=https://my.cdash.org
+export CDASH_TOKEN=your-token-here
+```
+
+```toml
+[mcp_servers.cdash]
+command = "uvx"
+args = ["--from", "git+https://github.com/cbyrohl/cdash-mcp", "cdash-mcp"]
+env_vars = ["CDASH_URL", "CDASH_TOKEN"]
+```
+
+See the [Codex MCP documentation](https://learn.chatgpt.com/docs/extend/mcp) for additional configuration and tool-policy options.
 
 ### Claude Code
 
@@ -74,7 +106,7 @@ uv run cdash-mcp
 
 > **Note:** Project names in CDash are case-sensitive (e.g. `"thor"` and `"THOR"` are different projects).
 
-## Tools (12)
+## Tools (11)
 
 ### Dashboard & Overview
 
@@ -111,8 +143,9 @@ uv run cdash-mcp
 
 **401 Authentication errors:**
 - Verify your token is valid in CDash under My Profile > Authentication Token.
+- For Codex, check `~/.codex/config.toml` (or `.codex/config.toml` for a trusted project), then start a new session and inspect `/mcp`.
 - Make sure the `env` block is in the right config file. For Claude Code, MCP servers must be defined in `~/.claude.json` — putting them in `~/.claude/settings.json` will silently ignore the env vars.
-- After changing config, restart the MCP server (`/mcp` in Claude Code, or restart the application).
+- After changing config, restart the MCP server (`/mcp` in Codex or Claude Code, or restart the application).
 
 **Project not found / empty dashboard:**
 - CDash project names are case-sensitive. Check the exact name in your CDash instance.
@@ -123,7 +156,7 @@ uv run cdash-mcp
 # Install dev dependencies
 uv sync
 
-# Run tests (hits my.cdash.org live)
+# Run tests (some tests hit a live CDash instance)
 uv run pytest tests/ -v
 
 # Lint
