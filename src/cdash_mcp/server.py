@@ -1,26 +1,37 @@
-"""FastMCP server exposing CDash CI/CD data as tools. [AI-Claude]"""
+"""Read-only MCP tools for current CDash APIs. [AI-Codex]"""
+
+from __future__ import annotations
 
 import logging
 import re
 import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import date as date_type
+from datetime import timedelta
+from functools import wraps
+from typing import Any
 
 from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
+from mcp.types import ToolAnnotations
 
-from .client import CDashClient, CDashError
+from .client import (
+    COVERAGE_FIELDS,
+    SUMMARY_FIELDS,
+    TEST_FIELDS,
+    CDashClient,
+    CDashError,
+    validate_date,
+    validate_page,
+)
 
-# Log to stderr only (STDIO transport uses stdout)
 logging.basicConfig(stream=sys.stderr, level=logging.INFO)
-logger = logging.getLogger("cdash-mcp")
 
 
 @asynccontextmanager
 async def lifespan(server: FastMCP) -> AsyncIterator[dict]:
-    """Share a single CDashClient across all tool invocations."""
-    client = CDashClient()
-    logger.info("CDash MCP server starting (base_url=%s)", client.base_url)
-    async with client:
+    async with CDashClient() as client:
         yield {"client": client}
 
 
@@ -28,102 +39,76 @@ mcp = FastMCP("cdash-mcp", lifespan=lifespan)
 
 
 def _get_client(ctx: Context) -> CDashClient:
-    """Extract the CDashClient from the request context."""
     return ctx.request_context.lifespan_context["client"]
 
 
-# ---------------------------------------------------------------------------
-# Tool: get_dashboard
-# ---------------------------------------------------------------------------
+def tool(fn):
+    """Mark tools read-only and propagate API failures as MCP errors."""
+
+    @wraps(fn)
+    async def wrapped(*args, **kwargs):
+        try:
+            return await fn(*args, **kwargs)
+        except CDashError as exc:
+            raise ToolError(str(exc)) from exc
+
+    return mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False))(wrapped)
 
 
-@mcp.tool()
-async def get_dashboard(
-    project: str,
-    date: str | None = None,
-    ctx: Context = None,
-) -> str:
-    """Get the CDash dashboard for a project, showing build groups and status.
+def _slice_output(value: str, offset: int, limit: int) -> dict[str, Any]:
+    if offset < 0 or limit < 0:
+        raise CDashError("Output offset and limit must be nonnegative; limit=0 means unlimited.")
+    output = value[offset : offset + limit] if limit else value[offset:]
+    return {
+        "text": output,
+        "total_characters": len(value),
+        "offset": offset,
+        "next_offset": offset + len(output) if offset + len(output) < len(value) else None,
+    }
 
-    Args:
-        project: CDash project name (e.g. "PublicDashboard").
-        date: Optional date (YYYY-MM-DD). Defaults to today.
-    """
-    client = _get_client(ctx)
-    try:
-        data = await client.get_dashboard(project, date)
-    except CDashError as e:
-        return f"Error: {e}"
 
-    lines: list[str] = []
-    title = data.get("title", project)
-    dashboard_date = data.get("datetime", date or "today")
-    lines.append(f"# {title} - Dashboard ({dashboard_date})")
-    lines.append("")
-
-    build_groups = data.get("buildgroups", [])
-    if not build_groups:
-        lines.append("No build groups found.")
-        return "\n".join(lines)
-
-    for group in build_groups:
-        group_name = group.get("name", "Unknown")
-        builds = group.get("builds", [])
-        lines.append(f"## {group_name} ({len(builds)} builds)")
-        lines.append("")
-
-        # Show up to 20 builds with issues first, then summarize rest
-        shown = 0
-        for build in builds:
-            name = build.get("buildname", "?")
-            site = build.get("site", "?")
-            configure_errors = build.get("configure", {}).get("error", 0)
-            compile_errors = build.get("compilation", {}).get("error", 0)
-            compile_warnings = build.get("compilation", {}).get("warning", 0)
-            test_fail = build.get("test", {}).get("fail", 0)
-            test_notrun = build.get("test", {}).get("notrun", 0)
-            test_pass = build.get("test", {}).get("pass", 0)
-            build_id = build.get("id", "?")
-
-            has_issues = (
-                configure_errors or compile_errors or test_fail or test_notrun
-            )
-
-            if has_issues or shown < 20:
-                status_parts = []
-                if configure_errors:
-                    status_parts.append(f"configure_err={configure_errors}")
-                if compile_errors:
-                    status_parts.append(f"compile_err={compile_errors}")
-                if compile_warnings:
-                    status_parts.append(f"warnings={compile_warnings}")
-                if test_fail:
-                    status_parts.append(f"test_fail={test_fail}")
-                if test_notrun:
-                    status_parts.append(f"test_notrun={test_notrun}")
-                if test_pass:
-                    status_parts.append(f"test_pass={test_pass}")
-
-                status = ", ".join(status_parts) if status_parts else "OK"
-                marker = "!!!" if has_issues else ""
-                lines.append(
-                    f"- {marker}[id={build_id}] {name} @ {site}: {status}"
+def _rest_tests(
+    client: CDashClient, data: dict[str, Any], limit: int, offset: int
+) -> dict[str, Any]:
+    validate_page(limit, offset)
+    rows = data.get("builds")
+    if not isinstance(rows, list):
+        raise CDashError("CDash test query returned no results list.")
+    items = []
+    for row in rows[offset : offset + limit]:
+        item = dict(row)
+        for link, key in [("buildSummaryLink", "build_id"), ("testDetailsLink", "test_id")]:
+            match = re.search(r"/(\d+)(?:\?.*)?$", str(item.get(link, "")))
+            if match:
+                item[key] = int(match[1])
+                item[key.replace("_id", "_url")] = (
+                    client.base_url.rstrip("/") + "/" + item[link].lstrip("/")
                 )
-                shown += 1
-
-        if shown < len(builds):
-            lines.append(f"  ... and {len(builds) - shown} more builds")
-        lines.append("")
-
-    return "\n".join(lines)
-
-
-# ---------------------------------------------------------------------------
-# Tool: get_failing_tests
-# ---------------------------------------------------------------------------
+        items.append(item)
+    return {
+        "items": items,
+        "total": len(rows),
+        "offset": offset,
+        "next_offset": offset + limit if offset + limit < len(rows) else None,
+        "pagination": "local slicing of REST query results",
+    }
 
 
-@mcp.tool()
+@tool
+async def get_dashboard(project: str, date: str | None = None, ctx: Context = None) -> dict:
+    """Dashboard build groups, counts and build IDs for a CDash calendar date."""
+    data = await _get_client(ctx).get_dashboard(project, date)
+    if "buildgroups" not in data:
+        raise CDashError("Dashboard response is missing build groups; check project access.")
+    return {
+        "project": project,
+        "date": data.get("date"),
+        "version": data.get("version", "").strip(),
+        "build_groups": data["buildgroups"],
+    }
+
+
+@tool
 async def get_failing_tests(
     project: str,
     date: str | None = None,
@@ -131,398 +116,86 @@ async def get_failing_tests(
     limit: int = 50,
     offset: int = 0,
     ctx: Context = None,
-) -> str:
-    """Find non-passing tests across all builds for a project. Most useful for CI triage.
-
-    Args:
-        project: CDash project name (e.g. "PublicDashboard").
-        date: Optional date (YYYY-MM-DD). Defaults to today.
-        test_name: Optional filter to match test names containing this string.
-        limit: Maximum number of tests to return (default 50, max 200).
-        offset: Number of tests to skip (default 0). Use for pagination.
-    """
+) -> dict:
+    """Non-passing results for a CDash date, including build/test IDs and URLs."""
+    validate_page(limit, offset)
     client = _get_client(ctx)
-    try:
-        data = await client.query_tests(project, date, test_name)
-    except CDashError as e:
-        return f"Error: {e}"
-
-    limit = max(1, min(limit, 200))
-    offset = max(0, offset)
-
-    lines: list[str] = []
-    lines.append(f"# Failing Tests for {project}")
-    lines.append("")
-
-    tests = data.get("builds", [])
-    if not tests:
-        lines.append("No failing tests found.")
-        return "\n".join(lines)
-
-    total = len(tests)
-    page = tests[offset : offset + limit]
-
-    if not page:
-        lines.append(
-            f"Found {total} non-passing test result(s)"
-            f" — no results in this range (offset={offset})."
-        )
-        return "\n".join(lines)
-
-    lines.append(
-        f"Found {total} non-passing test result(s)"
-        f" (showing {offset + 1}–{offset + len(page)}):"
-    )
-    lines.append("")
-
-    for t in page:
-        test_name_val = t.get("testname", "?")
-        status = t.get("status", "?")
-        build_name = t.get("buildName", "?")
-        site = t.get("site", "?")
-        details = t.get("details", "")
-        build_id_val = t.get("buildid", "?")
-
-        lines.append(f"- **{test_name_val}** [{status}]")
-        lines.append(f"  Build: {build_name} @ {site} (build_id={build_id_val})")
-        if details:
-            # Truncate long details
-            if len(details) > 200:
-                details = details[:200] + "..."
-            lines.append(f"  Details: {details}")
-        lines.append("")
-
-    remaining = total - offset - len(page)
-    if remaining > 0:
-        lines.append(f"... {remaining} more (use offset={offset + limit} to see next page)")
-
-    return "\n".join(lines)
+    return _rest_tests(client, await client.query_tests(project, date, test_name), limit, offset)
 
 
-# ---------------------------------------------------------------------------
-# Tool: get_build_details
-# ---------------------------------------------------------------------------
+@tool
+async def get_build_details(build_id: int, ctx: Context = None) -> dict:
+    """Build configure, compile and test counts, durations, site and source revision."""
+    return await _get_client(ctx).get_build_summary(build_id)
 
 
-@mcp.tool()
-async def get_build_details(
-    build_id: int,
-    ctx: Context = None,
-) -> str:
-    """Get detailed information about a specific build, including configure/compile/test summaries.
-
-    Args:
-        build_id: The CDash build ID.
-    """
-    client = _get_client(ctx)
-    try:
-        data = await client.get_build_summary(build_id)
-    except CDashError as e:
-        return f"Error: {e}"
-
-    lines: list[str] = []
-
-    build = data.get("build", {})
-    build_name = build.get("name", "?")
-    site = build.get("site", "?")
-    build_type = build.get("type", "?")
-    start_time = build.get("starttime", "?")
-    lines.append(f"# Build: {build_name}")
-    lines.append(f"**Site**: {site}  ")
-    lines.append(f"**Type**: {build_type}  ")
-    lines.append(f"**Started**: {start_time}  ")
-    lines.append(f"**Build ID**: {build_id}")
-    lines.append("")
-
-    # Configure summary
-    configure = data.get("configure", {})
-    if configure:
-        conf_errors = configure.get("nerrors", 0)
-        conf_warnings = configure.get("nwarnings", 0)
-        conf_status = "PASS" if conf_errors == 0 else "FAIL"
-        lines.append(
-            f"## Configure: {conf_status} "
-            f"({conf_errors} errors, {conf_warnings} warnings)"
-        )
-        lines.append("")
-
-    # Test summary
-    test = data.get("test", {})
-    if test:
-        test_pass = test.get("pass", 0)
-        test_fail = test.get("fail", 0)
-        test_notrun = test.get("notrun", 0)
-        lines.append(
-            f"## Tests: {test_pass} passed, {test_fail} failed, "
-            f"{test_notrun} not run"
-        )
-        lines.append("")
-
-    # Previous build comparison
-    prev = data.get("previousbuild", {})
-    if prev and prev.get("id"):
-        prev_id = prev["id"]
-        lines.append(f"## Previous build: id={prev_id}")
-        lines.append("")
-
-    # Update info
-    update = data.get("update", {})
-    if update:
-        n_files = update.get("files", 0)
-        if n_files:
-            lines.append(f"## Source changes: {n_files} file(s) updated")
-            lines.append("")
-
-    return "\n".join(lines)
-
-
-# ---------------------------------------------------------------------------
-# Tool: get_build_errors
-# ---------------------------------------------------------------------------
-
-
-@mcp.tool()
+@tool
 async def get_build_errors(
     build_id: int,
     warnings: bool = False,
     limit: int = 30,
-    offset: int = 0,
+    after: str | None = None,
+    output_offset: int = 0,
+    output_limit: int = 34816,
     ctx: Context = None,
-) -> str:
-    """View compiler errors or warnings for a build, with source file and line info.
-
-    Args:
-        build_id: The CDash build ID.
-        warnings: If True, show warnings instead of errors.
-        limit: Maximum number of errors to return (default 30, max 200).
-        offset: Number of errors to skip (default 0). Use for pagination.
+) -> dict:
+    """Compiler errors or warnings; paginate records with after and message text with
+    output_offset.
     """
-    client = _get_client(ctx)
-    try:
-        data = await client.get_build_errors(build_id, warnings=warnings)
-    except CDashError as e:
-        return f"Error: {e}"
-
-    limit = max(1, min(limit, 200))
-    offset = max(0, offset)
-
-    label = "Warnings" if warnings else "Errors"
-    lines: list[str] = []
-    lines.append(f"# Build {label} (build_id={build_id})")
-    lines.append("")
-
-    errors = data.get("errors", [])
-    if not errors:
-        lines.append(f"No {label.lower()} found.")
-        return "\n".join(lines)
-
-    total = len(errors)
-    page = errors[offset : offset + limit]
-
-    if not page:
-        lines.append(f"Found {total} {label.lower()} — no results in this range (offset={offset}).")
-        return "\n".join(lines)
-
-    lines.append(f"Found {total} {label.lower()} (showing {offset + 1}–{offset + len(page)}):")
-    lines.append("")
-
-    for err in page:
-        source_file = err.get("sourcefile", "")
-        source_line = err.get("sourceline", "")
-        text = err.get("text", "").strip()
-        precontext = err.get("precontext", "")
-        postcontext = err.get("postcontext", "")
-
-        if source_file:
-            loc = f"{source_file}:{source_line}" if source_line else source_file
-            lines.append(f"### {loc}")
-        else:
-            lines.append("### (no source location)")
-
-        if precontext:
-            lines.append(f"```\n{precontext}\n```")
-        if text:
-            # Truncate very long error messages
-            if len(text) > 500:
-                text = text[:500] + "..."
-            lines.append(f"```\n{text}\n```")
-        if postcontext:
-            lines.append(f"```\n{postcontext}\n```")
-        lines.append("")
-
-    remaining = total - offset - len(page)
-    if remaining > 0:
-        lines.append(f"... {remaining} more (use offset={offset + limit} to see next page)")
-
-    return "\n".join(lines)
+    _slice_output("", output_offset, output_limit)
+    page = await _get_client(ctx).get_build_errors(build_id, warnings, limit, after)
+    for item in page["items"]:
+        item["stdError"] = _slice_output(item.get("stdError") or "", output_offset, output_limit)
+        item["stdOutput"] = _slice_output(item.get("stdOutput") or "", output_offset, output_limit)
+    return page
 
 
-# ---------------------------------------------------------------------------
-# Tool: get_build_tests
-# ---------------------------------------------------------------------------
-
-
-@mcp.tool()
+@tool
 async def get_build_tests(
     build_id: int,
     status_filter: str | None = None,
     limit: int = 50,
-    offset: int = 0,
+    after: str | None = None,
     ctx: Context = None,
-) -> str:
-    """List tests for a specific build, optionally filtered by status.
-
-    Args:
-        build_id: The CDash build ID.
-        status_filter: Optional filter: "passed", "failed", or "notrun".
-        limit: Maximum number of tests to return (default 50, max 200).
-        offset: Number of tests to skip (default 0). Use for pagination.
+) -> dict:
+    """Tests, stable IDs and timing statistics. Filter: passed, failed or notrun. Use after to
+    paginate.
     """
-    client = _get_client(ctx)
-    try:
-        data = await client.get_build_tests(build_id, status_filter)
-    except CDashError as e:
-        return f"Error: {e}"
-
-    limit = max(1, min(limit, 200))
-    offset = max(0, offset)
-
-    lines: list[str] = []
-    filter_label = f" ({status_filter})" if status_filter else ""
-    lines.append(f"# Tests for build {build_id}{filter_label}")
-    lines.append("")
-
-    tests = data.get("tests", [])
-    if not tests:
-        lines.append("No tests found.")
-        return "\n".join(lines)
-
-    total = len(tests)
-    page = tests[offset : offset + limit]
-
-    if not page:
-        lines.append(f"Found {total} test(s) — no results in this range (offset={offset}).")
-        return "\n".join(lines)
-
-    lines.append(f"Found {total} test(s) (showing {offset + 1}–{offset + len(page)}):")
-    lines.append("")
-
-    for t in page:
-        name = t.get("name", "?")
-        status = t.get("status", "?")
-        exec_time = t.get("execTime", "?")
-        details = t.get("details", "")
-        build_test_id = t.get("buildtestid", "")
-
-        status_icon = {"Passed": "+", "Failed": "!", "Not Run": "-"}.get(
-            status, "?"
-        )
-        line = f"- [{status_icon}] **{name}** ({status}, {exec_time}s)"
-        if build_test_id:
-            line += f" [buildtestid={build_test_id}]"
-        if details:
-            if len(details) > 150:
-                details = details[:150] + "..."
-            line += f" — {details}"
-        lines.append(line)
-
-    remaining = total - offset - len(page)
-    if remaining > 0:
-        lines.append(f"\n... {remaining} more (use offset={offset + limit} to see next page)")
-
-    return "\n".join(lines)
+    page = await _get_client(ctx).get_build_tests(build_id, status_filter, limit, after)
+    for item in page["items"]:
+        item["test_url"] = f"{_get_client(ctx).base_url.rstrip('/')}/tests/{item['id']}"
+    return page
 
 
-# ---------------------------------------------------------------------------
-# Tool: get_configure_output
-# ---------------------------------------------------------------------------
-
-
-@mcp.tool()
+@tool
 async def get_configure_output(
-    build_id: int,
-    output_offset: int = 0,
-    output_limit: int = 34816,
-    ctx: Context = None,
-) -> str:
-    """View CMake configure command and output for a build.
-
-    Args:
-        build_id: The CDash build ID.
-        output_offset: Character offset into the configure output (default 0).
-        output_limit: Maximum characters of output to return (default 34816 = 34 KB).
-            Set to 0 for no limit.
+    build_id: int, output_offset: int = 0, output_limit: int = 34816, ctx: Context = None
+) -> dict:
+    """CMake command, return value and paginated configure log; output_limit=0 retrieves all
+    text.
     """
-    client = _get_client(ctx)
-    try:
-        data = await client.get_configure(build_id)
-    except CDashError as e:
-        return f"Error: {e}"
-
-    lines: list[str] = []
-    lines.append(f"# Configure Output (build_id={build_id})")
-    lines.append("")
-
-    configures = data.get("configures", [])
-    if not configures:
-        lines.append("No configure output found.")
-        return "\n".join(lines)
-
-    for conf in configures:
-        command = conf.get("command", "")
-        output = conf.get("output", "")
-        status = conf.get("status", "?")
-
-        status_label = "PASS" if str(status) == "0" else f"FAIL (status={status})"
-        lines.append(f"**Status**: {status_label}")
-        lines.append("")
-
-        if command:
-            lines.append("**Command**:")
-            lines.append(f"```\n{command}\n```")
-            lines.append("")
-
-        if output:
-            total_len = len(output)
-            if output_limit > 0:
-                output = output[output_offset : output_offset + output_limit]
-            elif output_offset > 0:
-                output = output[output_offset:]
-            lines.append(f"**Output** ({total_len} chars total):")
-            if output_offset > 0 or (
-                output_limit > 0 and output_offset + output_limit < total_len
-            ):
-                lines.append(
-                    f"*Showing chars {output_offset}–{output_offset + len(output)} "
-                    f"of {total_len}*"
-                )
-            lines.append(f"```\n{output}\n```")
-
-    return "\n".join(lines)
+    _slice_output("", output_offset, output_limit)
+    data = await _get_client(ctx).get_configure(build_id)
+    configure = data.get("configure")
+    if configure is not None:
+        configure["log"] = _slice_output(configure.get("log") or "", output_offset, output_limit)
+    return data
 
 
-# ---------------------------------------------------------------------------
-# (Removed) get_test_details
-#
-# CDash's REST API has no endpoint that returns a test's command/stdout/log
-# as JSON. /api/v1/testDetails.php is a binary file-download endpoint for
-# CTest ATTACHED_FILES measurements only, and the modern frontend reads
-# command/output via GraphQL — which on my.cdash.org accepts only Sanctum
-# session cookies, not Bearer tokens. Removed in favour of returning an
-# honest "not supported" rather than a misleading tool. To pull logs:
-#   1. attach them via CTest ATTACHED_FILES_ON_FAIL, then download
-#      /api/v1/testDetails.php?buildtestid=<id>&fileid=<n>, or
-#   2. drive /graphql with a browser session cookie, or
-#   3. make the project public so unauthenticated GraphQL works.
-# ---------------------------------------------------------------------------
+@tool
+async def get_test_details(
+    build_test_id: int, output_offset: int = 0, output_limit: int = 34816, ctx: Context = None
+) -> dict:
+    """Test command, status, measurements and paginated output. build_test_id is the current
+    test ID.
+    """
+    _slice_output("", output_offset, output_limit)
+    data = await _get_client(ctx).get_test_details(build_test_id)
+    data["output"] = _slice_output(data.get("output") or "", output_offset, output_limit)
+    return data
 
 
-# ---------------------------------------------------------------------------
-# Tool: get_test_summary
-# ---------------------------------------------------------------------------
-
-
-@mcp.tool()
+@tool
 async def get_test_summary(
     project: str,
     test_name: str,
@@ -530,429 +203,497 @@ async def get_test_summary(
     limit: int = 50,
     offset: int = 0,
     ctx: Context = None,
-) -> str:
-    """Get summary of a test across builds — shows pass/fail history to detect flaky tests.
-
-    Args:
-        project: CDash project name (e.g. "PublicDashboard").
-        test_name: Exact name of the test.
-        date: Optional date (YYYY-MM-DD). Defaults to today.
-        limit: Maximum number of builds to return (default 50, max 200).
-        offset: Number of builds to skip (default 0). Use for pagination.
+) -> dict:
+    """Exact-name test results across builds on one CDash date. Use get_test_history for
+    multiple dates.
     """
+    validate_page(limit, offset)
     client = _get_client(ctx)
-    try:
-        data = await client.get_test_summary(project, test_name, date)
-    except CDashError as e:
-        return f"Error: {e}"
-
-    limit = max(1, min(limit, 200))
-    offset = max(0, offset)
-
-    lines: list[str] = []
-    lines.append(f"# Test Summary: {test_name}")
-    lines.append("")
-
-    num_failed = data.get("numfailed", 0)
-    num_total = data.get("numtotal", 0)
-    pct_passed = data.get("percentagepassed", 0)
-    lines.append(
-        f"**Results**: {num_total - num_failed}/{num_total} passed "
-        f"({pct_passed:.1f}%)"
-    )
-    lines.append("")
-
-    builds = data.get("builds", [])
-    if not builds:
-        lines.append("No build results found.")
-        return "\n".join(lines)
-
-    total = len(builds)
-    page = builds[offset : offset + limit]
-
-    if not page:
-        lines.append(
-            f"Results across {total} build(s)"
-            f" — no results in this range (offset={offset})."
-        )
-        return "\n".join(lines)
-
-    lines.append(f"## Results across {total} build(s) (showing {offset + 1}–{offset + len(page)}):")
-    lines.append("")
-
-    for b in page:
-        site = b.get("site", "?")
-        build_name = b.get("buildName", "?")
-        status = b.get("status", "?")
-        time_val = b.get("time", "?")
-        build_id = b.get("buildid", "?")
-        status_icon = {"Passed": "+", "Failed": "!", "Not Run": "-"}.get(
-            status, "?"
-        )
-
-        line = (
-            f"- [{status_icon}] **{status}** — {build_name} @ {site} "
-            f"(build_id={build_id}, time={time_val}s)"
-        )
-
-        update = b.get("update", {})
-        if update and update.get("revision"):
-            line += f" rev={update['revision'][:12]}"
-        lines.append(line)
-
-    remaining = total - offset - len(page)
-    if remaining > 0:
-        lines.append(f"\n... {remaining} more (use offset={offset + limit} to see next page)")
-
-    return "\n".join(lines)
+    data = await client.get_test_summary(project, test_name, date)
+    result = _rest_tests(client, data, limit, offset)
+    rows = data["builds"]
+    result["status_counts"] = {
+        s: sum(r.get("status") == s for r in rows) for s in ("Passed", "Failed", "Not Run")
+    }
+    return result
 
 
-# ---------------------------------------------------------------------------
-# Tool: get_build_update
-# ---------------------------------------------------------------------------
+@tool
+async def get_build_update(build_id: int, ctx: Context = None) -> dict:
+    """Source revision, prior revision, update command and status."""
+    return await _get_client(ctx).get_build_update(build_id)
 
 
-@mcp.tool()
-async def get_build_update(
+@tool
+async def get_update_files(
     build_id: int,
+    limit: int = 50,
+    after: str | None = None,
     ctx: Context = None,
-) -> str:
-    """View source code changes (VCS commits) associated with a build.
-
-    Args:
-        build_id: The CDash build ID.
-    """
-    client = _get_client(ctx)
-    try:
-        data = await client.get_build_update(build_id)
-    except CDashError as e:
-        return f"Error: {e}"
-
-    lines: list[str] = []
-    lines.append(f"# Source Updates (build_id={build_id})")
-    lines.append("")
-
-    update = data.get("update", {})
-    if update:
-        revision = update.get("revision", "")
-        prior = update.get("priorrevision", "")
-        if revision:
-            lines.append(f"**Revision**: {revision}")
-        if prior:
-            lines.append(f"**Prior revision**: {prior}")
-        diff_url = update.get("revisiondiff", "")
-        if diff_url:
-            lines.append(f"**Diff URL**: {diff_url}")
-        lines.append("")
-
-    update_groups = data.get("updategroups", [])
-    if not update_groups:
-        lines.append("No source changes found.")
-        return "\n".join(lines)
-
-    total_files = 0
-    for group in update_groups:
-        description = group.get("description", "Files")
-        directories = group.get("directories", [])
-        if not directories:
-            continue
-
-        lines.append(f"## {description}")
-        lines.append("")
-
-        for d in directories:
-            dir_name = d.get("name", ".")
-            files = d.get("files", [])
-            for f in files:
-                filename = f.get("filename", "?")
-                author = f.get("author", "?")
-                log = f.get("log", "").strip()
-                revision = f.get("revision", "")
-
-                path = f"{dir_name}/{filename}" if dir_name != "." else filename
-                line = f"- `{path}` by **{author}**"
-                if revision:
-                    line += f" ({revision[:12]})"
-                lines.append(line)
-                if log:
-                    if len(log) > 200:
-                        log = log[:200] + "..."
-                    lines.append(f"  {log}")
-                total_files += 1
-
-        lines.append("")
-
-    if total_files == 0:
-        lines.append("No source changes found.")
-
-    return "\n".join(lines)
+) -> dict:
+    """Changed source files, authors and commit messages; paginated update records."""
+    return await _get_client(ctx).connection(
+        "build",
+        build_id,
+        "updateFiles",
+        "id fileName authorName log revision priorRevision status",
+        limit=limit,
+        after=after,
+    )
 
 
-# ---------------------------------------------------------------------------
-# Tool: get_project_overview
-# ---------------------------------------------------------------------------
+@tool
+async def get_project_overview(project: str, date: str | None = None, ctx: Context = None) -> dict:
+    """Project overview: build groups, coverage and analysis statistics."""
+    data = await _get_client(ctx).get_project_overview(project, date)
+    keys = (
+        "projectname",
+        "date",
+        "groups",
+        "coverages",
+        "dynamicanalyses",
+        "staticanalyses",
+        "measurements",
+    )
+    if "projectname" not in data:
+        raise CDashError("Project overview unavailable; check project access.")
+    return {key: data.get(key) for key in keys}
 
 
-@mcp.tool()
-async def get_project_overview(
-    project: str,
-    date: str | None = None,
+@tool
+async def get_build_coverage(
+    build_id: int,
+    limit: int = 50,
+    after: str | None = None,
+    path: str | None = None,
     ctx: Context = None,
-) -> str:
-    """Get project overview with aggregate build/test/coverage statistics.
+) -> dict:
+    """File line, branch and function coverage; optional path substring and cursor pagination."""
+    filters = {"contains": {"filePath": path}} if path else None
+    return await _get_client(ctx).connection(
+        "build", build_id, "coverage", COVERAGE_FIELDS, limit=limit, after=after, filters=filters
+    )
 
-    Args:
-        project: CDash project name (e.g. "PublicDashboard").
-        date: Optional date (YYYY-MM-DD). Defaults to today.
+
+@tool
+async def get_coverage_file(
+    build_id: int,
+    path: str,
+    output_offset: int = 0,
+    output_limit: int = 34816,
+    limit: int = 50,
+    after: str | None = None,
+    ctx: Context = None,
+) -> dict:
+    """Exact file's source and covered-line hit counts, if CDash permits source access."""
+    _slice_output("", output_offset, output_limit)
+    result = await _get_client(ctx).connection(
+        "build",
+        build_id,
+        "coverage",
+        COVERAGE_FIELDS + " file coveredLines { lineNumber timesHit totalBranches branchesHit }",
+        limit=limit,
+        after=after,
+        filters={"eq": {"filePath": path}},
+    )
+    for item in result["items"]:
+        if item.get("file") is not None:
+            item["file"] = _slice_output(item["file"], output_offset, output_limit)
+    return result
+
+
+@tool
+async def compare_build_coverage(
+    base_build_id: int, compare_build_id: int, limit: int = 50, offset: int = 0, ctx: Context = None
+) -> dict:
+    """Compare per-file coverage for two explicit builds; include added/removed files and
+    weighted totals.
     """
+    validate_page(limit, offset)
     client = _get_client(ctx)
-    try:
-        data = await client.get_project_overview(project, date)
-    except CDashError as e:
-        return f"Error: {e}"
+    base_meta = await client.build(base_build_id, "id project { id name }")
+    compare_meta = await client.build(compare_build_id, "id project { id name }")
+    if base_meta["project"]["id"] != compare_meta["project"]["id"]:
+        raise CDashError("Coverage comparisons require builds from the same project.")
+    base = await client.all_items("build", base_build_id, "coverage", COVERAGE_FIELDS)
+    compare = await client.all_items("build", compare_build_id, "coverage", COVERAGE_FIELDS)
 
-    lines: list[str] = []
-    title = data.get("title", f"{project} - Overview")
-    lines.append(f"# {title}")
-    lines.append("")
+    def totals(rows):
+        tested = sum(r["linesOfCodeTested"] for r in rows)
+        untested = sum(r["linesOfCodeUntested"] for r in rows)
+        return {
+            "tested": tested,
+            "untested": untested,
+            "percent": 100 * tested / (tested + untested) if tested + untested else None,
+        }
 
-    has_sub = data.get("hasSubProjects", False)
-    if has_sub:
-        lines.append("*This project has subprojects.*")
-        lines.append("")
+    def index(rows):
+        result = {}
+        for row in rows:
+            path = row.get("filePath")
+            if not isinstance(path, str) or not path.strip():
+                raise CDashError(
+                    f"Coverage record {row.get('id', '?')} in build "
+                    f"{row.get('build_id', '?')} has no usable file path; cannot compare coverage."
+                )
+            key = ((row.get("subproject") or {}).get("id", ""), path)
+            if key in result:
+                raise CDashError("Duplicate coverage files within a subproject prevent comparison.")
+            result[key] = row
+        return result
 
-    # Build groups
-    groups = data.get("groups", [])
-    if groups:
-        group_names = [g.get("name", "?") for g in groups]
-        lines.append(f"**Build groups**: {', '.join(group_names)}")
-        lines.append("")
-
-    # Coverage data
-    coverages = data.get("coverages", [])
-    if coverages:
-        lines.append("## Coverage")
-        for cov in coverages:
-            name = cov.get("name", "?")
-            lines.append(f"### {name}")
-            current = cov.get("current", {})
-            previous = cov.get("previous", {})
-            if current:
-                lines.append(f"  Current: {current}")
-            if previous:
-                lines.append(f"  Previous: {previous}")
-        lines.append("")
-
-    # Dynamic analysis
-    dyn = data.get("dynamicanalyses", [])
-    if dyn:
-        lines.append("## Dynamic Analysis")
-        for d in dyn:
-            lines.append(f"- {d.get('name', '?')}")
-        lines.append("")
-
-    # Static analysis
-    static = data.get("staticanalyses", [])
-    if static:
-        lines.append("## Static Analysis")
-        for s in static:
-            lines.append(f"- {s.get('name', '?')}")
-        lines.append("")
-
-    # Measurements
-    measurements = data.get("measurements", [])
-    if measurements:
-        lines.append("## Measurements")
-        for m in measurements:
-            lines.append(f"- {m.get('name', '?')}")
-        lines.append("")
-
-    return "\n".join(lines)
-
-
-# ---------------------------------------------------------------------------
-# Tool: get_coverage_comparison
-# ---------------------------------------------------------------------------
+    a, b = index(base), index(compare)
+    changes = []
+    metrics = (
+        "linesOfCodeTested",
+        "linesOfCodeUntested",
+        "branchesTested",
+        "branchesUntested",
+        "functionsTested",
+        "functionsUntested",
+    )
+    for path in sorted(a.keys() | b.keys()):
+        old, new = a.get(path), b.get(path)
+        if old is None or new is None or any(old[k] != new[k] for k in metrics):
+            changes.append(
+                {
+                    "path": path[1],
+                    "subproject": (new or old).get("subproject"),
+                    "base": old,
+                    "compare": new,
+                    "percentage_point_change": new["linePercentage"] - old["linePercentage"]
+                    if old is not None and new is not None
+                    else None,
+                }
+            )
+    return {
+        "base_build_id": base_build_id,
+        "compare_build_id": compare_build_id,
+        "base_totals": totals(base),
+        "compare_totals": totals(compare),
+        "changed_files": changes[offset : offset + limit],
+        "total_changed_files": len(changes),
+        "next_offset": offset + limit if offset + limit < len(changes) else None,
+        "note": "Per-file comparison; this does not compute patch coverage.",
+    }
 
 
-@mcp.tool()
+@tool
 async def get_coverage_comparison(
     project: str,
     date: str | None = None,
     build_id: int | None = None,
     limit: int = 50,
-    offset: int = 0,
+    after: str | None = None,
+    compare_build_id: int | None = None,
     ctx: Context = None,
-) -> str:
-    """Compare code coverage across builds for a project. Useful for detecting coverage regressions.
-
-    Args:
-        project: CDash project name (e.g. "PublicDashboard").
-        date: Optional date (YYYY-MM-DD). Defaults to today.
-        build_id: Optional build ID to get coverage for a specific build.
-            Recommended: provide a build_id from the dashboard for reliable results.
-            Without build_id, uses cross-build comparison (only works for Nightly builds).
-        limit: Maximum number of files to return (default 50, max 200).
-        offset: Number of files to skip (default 0). Use for pagination.
-    """
+) -> dict:
+    """Compatibility alias. Supply build_id for coverage, plus compare_build_id for comparison."""
+    validate_date(date)
+    validate_page(limit)
+    if build_id is None:
+        raise CDashError(
+            "Supply build_id; use search_builds to choose builds. "
+            "Prefer get_build_coverage or compare_build_coverage."
+        )
     client = _get_client(ctx)
-    try:
-        data = await client.get_coverage_comparison(project, date, build_id)
-    except CDashError as e:
-        return f"Error: {e}"
-
-    limit = max(1, min(limit, 200))
-    offset = max(0, offset)
-
-    lines: list[str] = []
-    lines.append(f"# Coverage Comparison — {project}")
-    lines.append("")
-
-    total_records = data.get("iTotalRecords", 0)
-    total_display = data.get("iTotalDisplayRecords", 0)
-
-    lines.append(f"**Total files**: {total_records}")
-    if total_display != total_records:
-        lines.append(f"**Displayed**: {total_display}")
-    lines.append("")
-
-    rows = data.get("aaData", [])
-    if not rows:
-        lines.append("No coverage data found.")
-        return "\n".join(lines)
-
-    total = len(rows)
-    page = rows[offset : offset + limit]
-
-    if not page:
-        lines.append(f"## Files ({total} total) — no results in this range (offset={offset}).")
-        return "\n".join(lines)
-
-    lines.append(f"## Files ({total} total, showing {offset + 1}–{offset + len(page)})")
-    lines.append("")
-
-    # CDash returns rows as arrays: [filename, status, percentage, untested, ...]
-    for row in page:
-        if len(row) >= 4:
-            filename = row[0]
-            # Strip HTML tags from filename
-            filename_clean = re.sub(r"<[^>]+>", "", str(filename)).strip()
-            status = re.sub(r"<[^>]+>", "", str(row[1])).strip()
-            pct = re.sub(r"<[^>]+>", "", str(row[2])).strip()
-            untested = re.sub(r"<[^>]+>", "", str(row[3])).strip()
-
-            lines.append(f"- `{filename_clean}`: {status} ({pct}) — {untested}")
-        else:
-            lines.append(f"- {row}")
-
-    remaining = total - offset - len(page)
-    if remaining > 0:
-        lines.append(f"\n... {remaining} more (use offset={offset + limit} to see next page)")
-
-    return "\n".join(lines)
+    build = await client.build(build_id, "id project { name }")
+    if build["project"]["name"] != project:
+        raise CDashError("build_id belongs to a different project.")
+    if compare_build_id is not None:
+        if after is not None:
+            raise CDashError("Use compare_build_coverage to paginate comparison results.")
+        return await compare_build_coverage(build_id, compare_build_id, limit, ctx=ctx)
+    return await client.connection("build", build_id, "coverage", COVERAGE_FIELDS, limit, after)
 
 
-# ---------------------------------------------------------------------------
-# Tool: get_dynamic_analysis
-# ---------------------------------------------------------------------------
-
-
-@mcp.tool()
+@tool
 async def get_dynamic_analysis(
+    build_id: int, limit: int = 50, after: str | None = None, ctx: Context = None
+) -> dict:
+    """Memory/sanitizer check results with checker, command and per-type defect counts."""
+    return await _get_client(ctx).get_dynamic_analysis(build_id, limit, after)
+
+
+@tool
+async def get_dynamic_analysis_details(
+    analysis_id: int, output_offset: int = 0, output_limit: int = 34816, ctx: Context = None
+) -> dict:
+    """Paginated log and defect details for a dynamic-analysis result."""
+    _slice_output("", output_offset, output_limit)
+    data = await _get_client(ctx).graphql(
+        """query($id:ID!) { dynamicAnalysis(id:$id) {
+        id name checker status fullCommandLine log defects { type value }
+    }}""",
+        {"id": str(analysis_id)},
+    )
+    result = data.get("dynamicAnalysis")
+    if result is None:
+        raise CDashError("Dynamic-analysis record was not found or is inaccessible.")
+    result["log"] = _slice_output(result.get("log") or "", output_offset, output_limit)
+    return result
+
+
+@tool
+async def check_connection(project: str | None = None, ctx: Context = None) -> dict:
+    """Check GraphQL authentication, project access, server version and available build fields."""
+    client = _get_client(ctx)
+    variables = {"project": project} if project else {}
+    data = await client.graphql('{ me { id } __type(name:"Build") { fields { name } } }', variables)
+    result = {
+        "base_url": client.base_url,
+        "authenticated": data.get("me") is not None,
+        "user_id": (data.get("me") or {}).get("id"),
+        "graphql": True,
+        "build_fields": [f["name"] for f in (data.get("__type") or {}).get("fields", [])],
+    }
+    if project:
+        access = await client.graphql(
+            "query($project:String!) { project(name:$project) { id name } }", variables
+        )
+        if access.get("project") is None:
+            raise CDashError("Project was not found or is inaccessible.")
+        result["project"] = access["project"]
+        result["version"] = (await client.get_dashboard(project)).get("version", "").strip()
+    return result
+
+
+def _date_filters(start_date, end_date):
+    validate_date(start_date)
+    validate_date(end_date)
+    if start_date and end_date and start_date > end_date:
+        raise CDashError("start_date must be on or before end_date.")
+    filters = []
+    if start_date:
+        filters.append({"ge": {"startTime": start_date + "T00:00:00Z"}})
+    if end_date:
+        try:
+            next_day = date_type.fromisoformat(end_date) + timedelta(days=1)
+        except OverflowError as exc:
+            raise CDashError("end_date must be before 9999-12-31.") from exc
+        filters.append({"lt": {"startTime": next_day.isoformat() + "T00:00:00Z"}})
+    return filters
+
+
+@tool
+async def search_builds(
+    project: str,
+    name: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    build_type: str | None = None,
+    revision: str | None = None,
+    limit: int = 50,
+    after: str | None = None,
+    ctx: Context = None,
+) -> dict:
+    """Search build history by name substring, inclusive UTC dates, type or exact source
+    revision.
+    """
+    filters = _date_filters(start_date, end_date)
+    if name:
+        filters.append({"contains": {"name": name}})
+    if build_type:
+        filters.append({"eq": {"buildType": build_type}})
+    if revision:
+        filters.append({"has": {"updateStep": {"eq": {"revision": revision}}}})
+    return await _get_client(ctx).connection(
+        "project",
+        project,
+        "builds",
+        SUMMARY_FIELDS,
+        limit=limit,
+        after=after,
+        filters={"all": filters} if filters else None,
+        order="DESC",
+    )
+
+
+@tool
+async def get_test_history(
+    project: str,
+    test_name: str,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    limit: int = 50,
+    after: str | None = None,
+    ctx: Context = None,
+) -> dict:
+    """Exact-name test history with build IDs and timing; optional inclusive UTC build-date
+    range.
+    """
+    filters = [{"eq": {"name": test_name}}]
+    dates = _date_filters(start_date, end_date)
+    if dates:
+        filters.append({"has": {"build": {"all": dates}}})
+    return await _get_client(ctx).connection(
+        "project",
+        project,
+        "tests",
+        TEST_FIELDS + " build { id name startTime updateStep { revision } }",
+        limit=limit,
+        after=after,
+        filters={"all": filters},
+        order="DESC",
+    )
+
+
+@tool
+async def compare_builds(
+    base_build_id: int, compare_build_id: int, limit: int = 50, offset: int = 0, ctx: Context = None
+) -> dict:
+    """Compare build counts and new/fixed test failures by exact test name; show runtime changes."""
+    validate_page(limit, offset)
+    client = _get_client(ctx)
+    base = await client.build(base_build_id)
+    compare = await client.build(compare_build_id)
+    if base["project"]["id"] != compare["project"]["id"]:
+        raise CDashError("Build comparisons require builds from the same project.")
+    old = await client.all_items("build", base_build_id, "tests", TEST_FIELDS)
+    new = await client.all_items("build", compare_build_id, "tests", TEST_FIELDS)
+
+    def index(rows):
+        result = {}
+        for row in rows:
+            key = ((row.get("subproject") or {}).get("id", ""), row["name"])
+            if key in result:
+                raise CDashError("Duplicate test names within a subproject prevent comparison.")
+            result[key] = row
+        return result
+
+    a, b = index(old), index(new)
+    changes = []
+    for name in sorted(a.keys() | b.keys()):
+        before, now = a.get(name), b.get(name)
+        if (
+            before is None
+            or now is None
+            or before["status"] != now["status"]
+            or before["runningTime"] != now["runningTime"]
+        ):
+            changes.append(
+                {
+                    "name": name[1],
+                    "subproject": (now or before).get("subproject"),
+                    "base": before,
+                    "compare": now,
+                    "new_failure": now is not None
+                    and now["status"] == "FAILED"
+                    and (before is None or before["status"] != "FAILED"),
+                    "fixed_failure": before is not None
+                    and before["status"] == "FAILED"
+                    and now is not None
+                    and now["status"] == "PASSED",
+                }
+            )
+    return {
+        "base": base,
+        "compare": compare,
+        "total_test_changes": len(changes),
+        "new_failures": [r["name"] for r in changes if r["new_failure"]],
+        "fixed_failures": [r["name"] for r in changes if r["fixed_failure"]],
+        "new_failure_results": [r for r in changes if r["new_failure"]],
+        "fixed_failure_results": [r for r in changes if r["fixed_failure"]],
+        "test_changes": changes[offset : offset + limit],
+        "next_offset": offset + limit if offset + limit < len(changes) else None,
+    }
+
+
+@tool
+async def get_build_triage(build_id: int, limit: int = 10, ctx: Context = None) -> dict:
+    """One-call build summary, configure log, compiler errors and failed tests; bounded first
+    pages.
+    """
+    validate_page(limit)
+    client = _get_client(ctx)
+    return {
+        "summary": await client.build(build_id),
+        "configure": await get_configure_output(build_id, ctx=ctx),
+        "compiler_errors": await get_build_errors(build_id, limit=limit, ctx=ctx),
+        "failed_tests": await get_build_tests(build_id, "failed", limit=limit, ctx=ctx),
+    }
+
+
+@tool
+async def get_build_notes(
     build_id: int,
     limit: int = 50,
-    offset: int = 0,
+    after: str | None = None,
+    output_offset: int = 0,
+    output_limit: int = 34816,
     ctx: Context = None,
-) -> str:
-    """Get dynamic analysis results (e.g. Valgrind, sanitizers) for a build.
-
-    Args:
-        build_id: The CDash build ID.
-        limit: Maximum number of defect entries to return (default 50, max 200).
-        offset: Number of defect entries to skip (default 0). Use for pagination.
+) -> dict:
+    """Build notes with paginated text (compiler environment, configuration or submitted
+    diagnostics).
     """
+    _slice_output("", output_offset, output_limit)
+    page = await _get_client(ctx).connection(
+        "build", build_id, "notes", "id name text", limit=limit, after=after
+    )
+    for item in page["items"]:
+        item["text"] = _slice_output(item.get("text") or "", output_offset, output_limit)
+    return page
+
+
+@tool
+async def get_build_artifacts(
+    build_id: int,
+    limit: int = 50,
+    after: str | None = None,
+    kind: str = "files",
+    ctx: Context = None,
+) -> dict:
+    """List uploaded files/download URLs or submitted links. kind is files or urls."""
+    if kind not in {"files", "urls"}:
+        raise CDashError("kind must be files or urls.")
     client = _get_client(ctx)
-    try:
-        data = await client.get_dynamic_analysis(build_id)
-    except CDashError as e:
-        return f"Error: {e}"
-
-    limit = max(1, min(limit, 200))
-    offset = max(0, offset)
-
-    lines: list[str] = []
-    title = data.get("title", f"Dynamic Analysis (build_id={build_id})")
-    lines.append(f"# {title}")
-    lines.append("")
-
-    build = data.get("build", {})
-    if build:
-        lines.append(f"**Build**: {build.get('buildname', '?')}")
-        lines.append(f"**Site**: {build.get('site', '?')}")
-        lines.append(f"**Time**: {build.get('buildtime', '?')}")
-        lines.append("")
-
-    # Defect type legend
-    defect_types = data.get("defecttypes", [])
-    if defect_types:
-        type_names = [d.get("type", "?") for d in defect_types]
-        lines.append(f"**Defect types**: {', '.join(type_names)}")
-        lines.append("")
-
-    analyses = data.get("dynamicanalyses", [])
-    if not analyses:
-        lines.append("No dynamic analysis results found.")
-        return "\n".join(lines)
-
-    lines.append(f"## Results ({len(analyses)} tests)")
-    lines.append("")
-
-    # Show tests with defects first, then clean ones
-    with_defects = []
-    clean = 0
-    for a in analyses:
-        name = a.get("name", "?")
-        status = a.get("status", "?")
-        defects = a.get("defects", [])
-        try:
-            total_defects = sum(int(d) for d in defects)
-        except (ValueError, TypeError):
-            total_defects = 0
-
-        if total_defects > 0:
-            with_defects.append((name, status, defects, total_defects))
-        else:
-            clean += 1
-
-    total = len(with_defects)
-    page = with_defects[offset : offset + limit]
-
-    if not page and total > 0:
-        lines.append(f"{total} test(s) with defects — no results in this range (offset={offset}).")
-    elif page:
-        lines.append(f"Showing defects {offset + 1}–{offset + len(page)} of {total}:")
-        lines.append("")
-        for name, status, defects, total_defects in page:
-            lines.append(f"- **{name}** [{status}] — {total_defects} defect(s)")
-
-        remaining = total - offset - len(page)
-        if remaining > 0:
-            lines.append(
-                f"\n... {remaining} more with defects"
-                f" (use offset={offset + limit} to see next page)"
+    fields = "id name size sha1sum" if kind == "files" else "id href"
+    page = await client.connection("build", build_id, kind, fields, limit=limit, after=after)
+    if kind == "files":
+        for item in page["items"]:
+            item["download_url"] = (
+                f"{client.base_url.rstrip('/')}/builds/{build_id}/files/{item['id']}"
             )
-
-    if clean:
-        lines.append(f"\n{clean} test(s) with no defects (clean)")
-
-    return "\n".join(lines)
+    return page
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
+@tool
+async def get_build_commands(
+    build_id: int, limit: int = 50, after: str | None = None, ctx: Context = None
+) -> dict:
+    """Submitted CMake instrumentation: command timings, results and resource measurements."""
+    return await _get_client(ctx).connection(
+        "build",
+        build_id,
+        "commands",
+        """
+        id type command startTime duration result workingDirectory source language config
+        measurements(first:20) {
+            edges { node { name type value } } pageInfo { hasNextPage endCursor }
+        }
+    """,
+        limit=limit,
+        after=after,
+    )
+
+
+@tool
+async def get_test_images(
+    build_test_id: int,
+    limit: int = 50,
+    after: str | None = None,
+    ctx: Context = None,
+) -> dict:
+    """List submitted test images and their URLs, with cursor pagination."""
+    return await _get_client(ctx).connection(
+        "test",
+        build_test_id,
+        "testImages",
+        "id role url",
+        limit=limit,
+        after=after,
+    )
 
 
 def main():
-    """Run the CDash MCP server."""
     mcp.run()

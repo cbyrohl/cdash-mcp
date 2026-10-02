@@ -24,6 +24,4 @@ jobs:
       - name: Lint
         run: uv run ruff check src/ tests/
       - name: Test
-        run: uv run pytest tests/ -v
-        env:
-          CDASH_URL: https://open.cdash.org
+        run: uv run pytest tests/ -m "not integration" -v

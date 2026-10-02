@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cdash-mcp"
-version = "0.1.0"
+version = "0.2.0"
 description = "MCP server for querying Kitware CDash CI/CD build and test results"
 readme = "README.md"
 license = "MIT"
@@ -36,6 +36,7 @@ packages = ["src/cdash_mcp"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+addopts = "-m 'not integration'"
 markers = ["integration: tests that hit the live CDash API"]
 
 [tool.ruff]
