@@ -5,7 +5,7 @@
 
 An [MCP](https://modelcontextprotocol.io/) server for [Kitware CDash](https://www.cdash.org/) — the CI/CD dashboard for projects built with CMake/CTest. Browse dashboards, find failing tests, inspect build errors, check coverage, and triage CI failures, all through natural language. Works with OpenAI Codex, Claude Desktop/Code, Cursor, and any MCP-compatible client.
 
-Provides 11 tools for navigating CDash builds, tests, coverage, and dynamic analysis.
+Provides 26 read-only tools for navigating CDash builds, tests, coverage, and dynamic analysis.
 
 ## Quick Start
 
@@ -106,43 +106,90 @@ uv run cdash-mcp
 
 > **Note:** Project names in CDash are case-sensitive (e.g. `"thor"` and `"THOR"` are different projects).
 
-## Tools (11)
+## API compatibility and authentication
 
-### Dashboard & Overview
+The modern client uses GraphQL for build inspection and supported REST endpoints
+for dashboards and project-wide test queries. Tested against `my.cdash.org`
+CDash 5.4. The legacy build summary, compiler error, configure, test history,
+source update, and coverage URL paths are no longer called. Older CDash versions
+are not automatically supported: use `check_connection` to inspect available
+fields, and report unsupported fields rather than treating them as empty results.
 
-| Tool | Description |
-|------|-------------|
-| `get_dashboard` | Dashboard overview: build groups, pass/fail counts, build IDs |
-| `get_project_overview` | Aggregate build/test/coverage statistics for a project |
+Private projects require a valid, unexpired **full-access** token belonging to a
+user with project access. Submission-only tokens cannot authenticate this client.
+The client first calls a REST endpoint to establish a session cookie, then uses
+that cookie with GraphQL. Session authentication is retried once when access is
+denied; persistent permission failures remain errors. No token is included in
+client representations or tool results.
 
-### Test Triage
+All tools are read-only. API failures set the MCP error flag. Results are JSON
+objects rather than the previous Markdown summaries, and use current CDash
+field names. IDs from GraphQL are strings. Test-query REST results additionally
+include numeric `build_id` and `test_id` fields and navigable URLs.
 
-| Tool | Description |
-|------|-------------|
-| `get_failing_tests` | Find non-passing tests across all builds (CI triage entry point) |
-| `get_build_tests` | List tests for a specific build, filter by passed/failed/notrun |
-| `get_test_summary` | Test pass/fail history across builds — detect flaky tests |
+## Tools (26)
 
-### Build Inspection
+| Tool | Purpose |
+|------|---------|
+| `check_connection` | Authentication, project access, server version and available build fields |
+| `get_dashboard` | Dashboard build groups and configure/compile/test counts |
+| `get_project_overview` | Project coverage, analysis and build-group overview |
+| `search_builds` | Build history by name, UTC date range, type or exact revision |
+| `get_build_details` | Build counts, durations, site, compiler and revision |
+| `get_build_triage` | Summary, configure log, compiler errors and failed tests in one call |
+| `get_build_errors` | Errors or warnings, source locations, commands and retrievable context |
+| `get_configure_output` | Configure command, return value and log |
+| `get_build_update` | Revision, prior revision and update status |
+| `get_update_files` | Changed files, authors and commit messages |
+| `get_failing_tests` | Non-passing test results on a CDash date, with build/test IDs |
+| `get_build_tests` | Per-build tests, status filters and timing statistics |
+| `get_test_details` | Restored test command, measurements, status and output |
+| `get_test_images` | Submitted regression images and their URLs |
+| `get_test_summary` | Exact-name results across builds on one CDash date |
+| `get_test_history` | Exact-name history across an optional UTC build-date range |
+| `compare_builds` | New/fixed test failures, statuses, runtimes and build counts |
+| `get_build_coverage` | File line, branch and function coverage |
+| `get_coverage_file` | Exact file's source (when permitted) and line hit counts |
+| `compare_build_coverage` | Explicit build pair, changed/added/removed files and weighted line totals |
+| `get_coverage_comparison` | Compatibility alias requiring an explicit `build_id` |
+| `get_dynamic_analysis` | Checker, command and per-type defect counts |
+| `get_dynamic_analysis_details` | Individual analysis log and defects |
+| `get_build_notes` | Submitted notes with retrievable text |
+| `get_build_artifacts` | Uploaded files/download URLs or submitted links |
+| `get_build_commands` | Submitted CMake command timings and resource measurements |
 
-| Tool | Description |
-|------|-------------|
-| `get_build_details` | Drill into a build: configure/compile/test summary |
-| `get_build_errors` | Compiler errors or warnings with source file and line info |
-| `get_configure_output` | CMake configure command and output |
-| `get_build_update` | Source code changes (VCS commits) associated with a build |
+### Pagination and output
 
-### Coverage & Analysis
+GraphQL lists return `items` and `page_info`. Pass `page_info.endCursor` as
+`after` when `hasNextPage` is true. Page sizes are 1–200. Existing per-build
+`offset` arguments remain supported by traversing cursors; do not combine
+`offset` and `after`. REST test queries retain local `limit`/`offset` slicing and
+identify that explicitly in their results.
 
-| Tool | Description |
-|------|-------------|
-| `get_coverage_comparison` | Compare code coverage across builds, detect regressions |
-| `get_dynamic_analysis` | Dynamic analysis results (Valgrind, sanitizers) |
+Logs use `output_offset` and `output_limit` (default 34,816 characters). A sliced
+text object includes `text`, `total_characters`, `offset` and `next_offset`.
+Use `next_offset` to continue, or `output_limit=0` for the complete text.
+
+Build searches and multi-date history use inclusive UTC calendar dates; dashboard
+and test-summary dates follow CDash's configured dashboard day. These can differ
+when the nightly rollover is not midnight.
+
+Comparisons fetch all relevant records, up to 10,000 per build, before computing
+changes. Larger results fail explicitly. Duplicate test names also fail rather
+than guessing which results correspond. A fixed failure means `FAILED` became
+`PASSED`; removed or skipped tests are not counted as fixes. Coverage percentages
+are weighted by executable line counts, and file comparisons do not compute
+patch coverage.
+
+CMake instrumentation and artifacts are available only when submitted by CI.
+Nested command measurements expose their own pagination information; this tool
+currently retrieves the first 20 measurements per command.
 
 ## Troubleshooting
 
-**401 Authentication errors:**
-- Verify your token is valid in CDash under My Profile > Authentication Token.
+**Authentication or authorization errors:**
+- Verify your token is valid, unexpired and full-access in CDash under My Profile > Authentication Token.
+- Run `check_connection` with your project name to verify authentication and membership.
 - For Codex, check `~/.codex/config.toml` (or `.codex/config.toml` for a trusted project), then start a new session and inspect `/mcp`.
 - Make sure the `env` block is in the right config file. For Claude Code, MCP servers must be defined in `~/.claude.json` — putting them in `~/.claude/settings.json` will silently ignore the env vars.
 - After changing config, restart the MCP server (`/mcp` in Codex or Claude Code, or restart the application).
@@ -156,8 +203,12 @@ uv run cdash-mcp
 # Install dev dependencies
 uv sync
 
-# Run tests (some tests hit a live CDash instance)
-uv run pytest tests/ -v
+# Run deterministic tests, including MCP and STDIO transport (no network)
+uv run pytest -v
+
+# Opt in to live smoke tests; export CDASH_TOKEN securely if needed
+CDASH_URL=https://open.cdash.org CDASH_LIVE_PROJECT=PublicDashboard \
+  uv run pytest -m integration -v
 
 # Lint
 uv run ruff check src/ tests/

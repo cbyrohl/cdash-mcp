@@ -1,6 +1,7 @@
 """STDIO transport integration tests for MCP clients such as Codex."""
 
 import sys
+from pathlib import Path
 
 import pytest
 from mcp.client.session import ClientSession
@@ -13,6 +14,7 @@ async def test_stdio_transport_lists_tools():
     server = StdioServerParameters(
         command=sys.executable,
         args=["-m", "cdash_mcp"],
+        env={"PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src"), "CDASH_TOKEN": ""},
     )
 
     async with stdio_client(server) as (read_stream, write_stream):
@@ -21,5 +23,5 @@ async def test_stdio_transport_lists_tools():
             tools = await client.list_tools()
 
     assert initialized.serverInfo.name == "cdash-mcp"
-    assert len(tools.tools) == 11
+    assert len(tools.tools) == 26
     assert "get_dashboard" in {tool.name for tool in tools.tools}

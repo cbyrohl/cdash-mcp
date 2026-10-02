@@ -1,157 +1,182 @@
-"""MCP tool tests using in-process memory streams. [AI-Claude]"""
+"""Every exposed tool is tested offline; failures remain MCP errors. [AI-Codex]"""
 
-import anyio
+import json
+from contextlib import asynccontextmanager
+
 import pytest
-from mcp.client.session import ClientSession
-from mcp.shared.message import SessionMessage
+from mcp.server.fastmcp.exceptions import ToolError
 
-PROJECT = "PublicDashboard"
+from cdash_mcp import server as s
+
+CASES = [
+    ("get_test_images", {"build_test_id": 10}),
+    ("check_connection", {"project": "thor"}),
+    ("get_dashboard", {"project": "thor"}),
+    ("get_failing_tests", {"project": "thor"}),
+    ("get_build_details", {"build_id": 1}),
+    ("get_build_errors", {"build_id": 1}),
+    ("get_build_tests", {"build_id": 1}),
+    ("get_configure_output", {"build_id": 1}),
+    ("get_test_details", {"build_test_id": 10}),
+    ("get_test_summary", {"project": "thor", "test_name": "fixed"}),
+    ("get_build_update", {"build_id": 1}),
+    ("get_update_files", {"build_id": 1}),
+    ("get_project_overview", {"project": "thor"}),
+    ("get_build_coverage", {"build_id": 1}),
+    ("get_coverage_file", {"build_id": 1, "path": "src/a.cpp"}),
+    ("compare_build_coverage", {"base_build_id": 1, "compare_build_id": 2}),
+    ("get_coverage_comparison", {"project": "thor", "build_id": 1}),
+    ("get_dynamic_analysis", {"build_id": 1}),
+    ("get_dynamic_analysis_details", {"analysis_id": 1}),
+    ("search_builds", {"project": "thor"}),
+    ("get_test_history", {"project": "thor", "test_name": "fixed"}),
+    ("compare_builds", {"base_build_id": 1, "compare_build_id": 2}),
+    ("get_build_triage", {"build_id": 1}),
+    ("get_build_notes", {"build_id": 1}),
+    ("get_build_artifacts", {"build_id": 1}),
+    ("get_build_commands", {"build_id": 1}),
+]
 
 
-async def _forward(reader, writer):
-    """Forward messages from reader stream to writer stream."""
-    async for msg in reader:
-        await writer.send(msg)
+@pytest.mark.parametrize("name,args", CASES)
+async def test_every_tool(name, args, ctx):
+    result = await getattr(s, name)(**args, ctx=ctx)
+    assert isinstance(result, dict)
+    assert "Error" not in result
 
 
-async def _run_with_client(fn):
-    """Set up MCP client/server, run fn(client), then tear down cleanly."""
-    from cdash_mcp.server import mcp as fastmcp
+async def test_tool_registration():
+    tools = await s.mcp.list_tools()
+    assert {t.name for t in tools} == {name for name, _ in CASES}
+    assert all(t.annotations.readOnlyHint and not t.annotations.destructiveHint for t in tools)
 
-    # Server-side streams
-    s_read_w, s_read = anyio.create_memory_object_stream[SessionMessage | Exception](0)
-    s_write, s_write_r = anyio.create_memory_object_stream[SessionMessage](0)
 
-    # Client-side streams
-    c_write, c_write_r = anyio.create_memory_object_stream[SessionMessage](0)
-    c_read_w, c_read = anyio.create_memory_object_stream[SessionMessage | Exception](0)
+async def test_ids_and_urls(ctx):
+    result = await s.get_failing_tests("thor", ctx=ctx)
+    item = result["items"][0]
+    assert item["build_id"] == 1 and item["test_id"] == 10
+    assert item["test_url"] == "https://cdash.test/tests/10"
 
+
+async def test_long_compiler_message_is_retrievable(ctx):
+    result = await s.get_build_errors(1, output_offset=500, output_limit=300, ctx=ctx)
+    message = result["items"][0]["stdError"]
+    assert message == {
+        "text": "x" * 300,
+        "total_characters": 1000,
+        "offset": 500,
+        "next_offset": 800,
+    }
+    full = await s.get_build_errors(1, output_limit=0, ctx=ctx)
+    assert len(full["items"][0]["stdError"]["text"]) == 1000
+
+
+async def test_configure_and_test_output_slicing(ctx):
+    cfg = await s.get_configure_output(1, output_offset=2, output_limit=3, ctx=ctx)
+    test = await s.get_test_details(10, output_offset=2, output_limit=3, ctx=ctx)
+    assert cfg["configure"]["log"]["text"] == test["output"]["text"] == "234"
+    assert test["output"]["next_offset"] == 5
+
+
+async def test_compare_builds_semantics(ctx):
+    result = await s.compare_builds(1, 2, ctx=ctx)
+    assert result["new_failures"] == ["new"]
+    assert result["fixed_failures"] == ["fixed"]
+    assert result["total_test_changes"] == 2
+
+
+async def test_coverage_weighted_totals_and_added_files(ctx):
+    result = await s.compare_build_coverage(1, 2, ctx=ctx)
+    assert result["base_totals"]["percent"] == 25
+    assert result["compare_totals"]["percent"] == pytest.approx(92 / 104 * 100)
+    assert result["changed_files"][0]["percentage_point_change"] == 25
+    assert result["changed_files"][1]["base"] is None
+
+
+async def test_build_search_filters_use_variables(ctx, cdash_api):
+    await s.search_builds(
+        "thor",
+        name='quote"',
+        start_date="2026-10-01",
+        end_date="2026-10-02",
+        revision="abc",
+        ctx=ctx,
+    )
+    payload = json.loads(cdash_api[1][-1].content)
+    assert 'quote"' not in payload["query"]
+    assert {"contains": {"name": 'quote"'}} in payload["variables"]["filters"]["all"]
+    assert {"lt": {"startTime": "2026-10-03T00:00:00Z"}} in payload["variables"]["filters"]["all"]
+
+
+async def test_artifact_download_url(ctx):
+    result = await s.get_build_artifacts(1, ctx=ctx)
+    assert result["items"][0]["download_url"] == "https://cdash.test/builds/1/files/1"
+    assert (await s.get_build_artifacts(1, kind="urls", ctx=ctx))["items"][0]["href"]
+
+
+@pytest.mark.parametrize(
+    "name,args",
+    [
+        ("get_build_tests", {"build_id": 1, "status_filter": "bad"}),
+        ("get_test_details", {"build_test_id": 10, "output_limit": -1}),
+        ("get_build_artifacts", {"build_id": 1, "kind": "bad"}),
+        ("get_coverage_comparison", {"project": "thor"}),
+        (
+            "search_builds",
+            {"project": "thor", "start_date": "2026-10-02", "end_date": "2026-10-01"},
+        ),
+    ],
+)
+async def test_validation_is_tool_error(name, args, ctx):
+    with pytest.raises(ToolError):
+        await getattr(s, name)(**args, ctx=ctx)
+
+
+async def test_mcp_error_flag_and_transport(client, monkeypatch):
+    # Exercise the actual MCP client/server protocol with a deterministic client.
+    import anyio
+    from mcp.client.session import ClientSession
+    from mcp.shared.message import SessionMessage
+
+    @asynccontextmanager
+    async def fake_lifespan(server):
+        yield {"client": client}
+
+    monkeypatch.setattr(s.mcp._mcp_server, "lifespan", fake_lifespan)
+    read_w, read = anyio.create_memory_object_stream[SessionMessage | Exception](0)
+    write, write_r = anyio.create_memory_object_stream[SessionMessage](0)
     async with anyio.create_task_group() as tg:
-        init_opts = fastmcp._mcp_server.create_initialization_options()
-        tg.start_soon(fastmcp._mcp_server.run, s_read, s_write, init_opts)
-        tg.start_soon(_forward, c_write_r, s_read_w)
-        tg.start_soon(_forward, s_write_r, c_read_w)
-
-        async with ClientSession(c_read, c_write) as client:
-            await client.initialize()
-            await fn(client)
-
-        # Signal shutdown
+        tg.start_soon(
+            s.mcp._mcp_server.run, read, write, s.mcp._mcp_server.create_initialization_options()
+        )
+        async with ClientSession(write_r, read_w) as session:
+            await session.initialize()
+            result = await session.call_tool("get_coverage_comparison", {"project": "thor"})
+            assert result.isError
+            assert "Supply build_id" in result.content[0].text
+            good = await session.call_tool("get_build_tests", {"build_id": 1, "limit": 1})
+            assert not good.isError
+            assert "fixed" in good.content[0].text
         tg.cancel_scope.cancel()
 
 
-@pytest.mark.anyio
-async def test_list_tools():
-    """Server exposes all 11 tools. [AI]"""
+async def test_duplicate_test_names_fail_comparison(ctx, client, monkeypatch):
+    async def duplicate_rows(*args, **kwargs):
+        return [{"name": "duplicate"}, {"name": "duplicate"}]
 
-    async def check(client):
-        result = await client.list_tools()
-        tool_names = {t.name for t in result.tools}
-        expected = {
-            "get_dashboard",
-            "get_failing_tests",
-            "get_build_details",
-            "get_build_errors",
-            "get_build_tests",
-            "get_configure_output",
-            "get_test_summary",
-            "get_build_update",
-            "get_project_overview",
-            "get_coverage_comparison",
-            "get_dynamic_analysis",
-        }
-        assert expected == tool_names
-
-    await _run_with_client(check)
+    monkeypatch.setattr(client, "all_items", duplicate_rows)
+    with pytest.raises(ToolError, match="Duplicate test names"):
+        await s.compare_builds(1, 2, ctx=ctx)
 
 
-@pytest.mark.anyio
-async def test_get_dashboard_tool():
-    """get_dashboard tool returns formatted dashboard text. [AI]"""
-
-    async def check(client):
-        result = await client.call_tool(
-            "get_dashboard", {"project": PROJECT}
-        )
-        assert not result.isError
-        text = result.content[0].text
-        assert "Dashboard" in text
-
-    await _run_with_client(check)
+async def test_date_overflow_is_tool_error(ctx):
+    with pytest.raises(ToolError, match="end_date"):
+        await s.search_builds("thor", end_date="9999-12-31", ctx=ctx)
 
 
-@pytest.mark.anyio
-async def test_get_failing_tests_tool():
-    """get_failing_tests tool returns formatted test results. [AI]"""
-
-    async def check(client):
-        result = await client.call_tool(
-            "get_failing_tests", {"project": PROJECT}
-        )
-        assert not result.isError
-        text = result.content[0].text
-        assert "Failing Tests" in text
-
-    await _run_with_client(check)
-
-
-@pytest.mark.anyio
-async def test_get_build_tests_pagination():
-    """get_build_tests respects limit and offset parameters. [AI]"""
-
-    async def check(client):
-        # First, get the dashboard to find a build with tests
-        dash = await client.call_tool(
-            "get_dashboard", {"project": PROJECT}
-        )
-        assert not dash.isError
-        text = dash.content[0].text
-        # Extract a build_id from dashboard output
-        import re
-        ids = re.findall(r"id=(\d+)", text)
-        assert ids, "No builds found on dashboard"
-        build_id = int(ids[0])
-
-        # Fetch first page with limit=2
-        page1 = await client.call_tool(
-            "get_build_tests",
-            {"build_id": build_id, "limit": 2, "offset": 0},
-        )
-        assert not page1.isError
-        text1 = page1.content[0].text
-
-        # Fetch second page with limit=2, offset=2
-        page2 = await client.call_tool(
-            "get_build_tests",
-            {"build_id": build_id, "limit": 2, "offset": 2},
-        )
-        assert not page2.isError
-        text2 = page2.content[0].text
-
-        # Both should mention the build, but show different ranges
-        assert f"build {build_id}" in text1
-        assert f"build {build_id}" in text2
-
-        # If there are tests, page 1 should show "1–" and page 2 "3–"
-        if "No tests found" not in text1:
-            assert "showing 1\u2013" in text1
-        if "No tests found" not in text2 and "no results in this range" not in text2:
-            assert "showing 3\u2013" in text2
-
-    await _run_with_client(check)
-
-
-@pytest.mark.anyio
-async def test_get_dashboard_invalid_project():
-    """get_dashboard with invalid project returns graceful response. [AI]"""
-
-    async def check(client):
-        result = await client.call_tool(
-            "get_dashboard", {"project": "NonExistentProject12345"}
-        )
-        # CDash may return empty data or error - tool should handle gracefully
-        assert not result.isError
-        text = result.content[0].text
-        assert isinstance(text, str)
-
-    await _run_with_client(check)
+async def test_negative_ids_fail_before_http(ctx, cdash_api):
+    with pytest.raises(ToolError, match="positive"):
+        await s.get_dynamic_analysis_details(-1, ctx=ctx)
+    with pytest.raises(ToolError, match="positive"):
+        await s.get_update_files(-1, ctx=ctx)
+    assert cdash_api[1] == []
