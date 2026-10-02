@@ -180,3 +180,25 @@ async def test_negative_ids_fail_before_http(ctx, cdash_api):
     with pytest.raises(ToolError, match="positive"):
         await s.get_update_files(-1, ctx=ctx)
     assert cdash_api[1] == []
+
+
+@pytest.mark.parametrize("bad_path", [None, 42, "", "   "])
+@pytest.mark.parametrize("affected_build", [1, 2])
+async def test_coverage_comparison_rejects_unusable_paths(
+    ctx,
+    client,
+    monkeypatch,
+    bad_path,
+    affected_build,
+):
+    original = client.all_items
+
+    async def coverage_with_unusable_path(parent, build_id, relation, fields, **kwargs):
+        rows = await original(parent, build_id, relation, fields, **kwargs)
+        if build_id == affected_build:
+            rows.append({**rows[0], "id": "bad-path-record", "filePath": bad_path})
+        return rows
+
+    monkeypatch.setattr(client, "all_items", coverage_with_unusable_path)
+    with pytest.raises(ToolError, match=f"bad-path-record.*build {affected_build}.*file path"):
+        await s.compare_build_coverage(1, 2, ctx=ctx)

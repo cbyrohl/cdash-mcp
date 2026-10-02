@@ -339,7 +339,13 @@ async def compare_build_coverage(
     def index(rows):
         result = {}
         for row in rows:
-            key = ((row.get("subproject") or {}).get("id", ""), row["filePath"])
+            path = row.get("filePath")
+            if not isinstance(path, str) or not path.strip():
+                raise CDashError(
+                    f"Coverage record {row.get('id', '?')} in build "
+                    f"{row.get('build_id', '?')} has no usable file path; cannot compare coverage."
+                )
+            key = ((row.get("subproject") or {}).get("id", ""), path)
             if key in result:
                 raise CDashError("Duplicate coverage files within a subproject prevent comparison.")
             result[key] = row
