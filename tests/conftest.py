@@ -121,6 +121,22 @@ def cdash_api():
                     }
                 },
             )
+        if "children(first:" in query:
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "build": {
+                            "id": variables["id"],
+                            "subProject": None,
+                            "children": {
+                                "edges": [],
+                                "pageInfo": {"hasNextPage": False, "endCursor": None},
+                            },
+                        }
+                    }
+                },
+            )
         parent = (
             "project" if "project(name:" in query else ("test" if "test(id:" in query else "build")
         )

@@ -160,6 +160,15 @@ include numeric `build_id` and `test_id` fields and navigable URLs.
 
 ### Pagination and output
 
+Build-scoped test, compiler-diagnostic, coverage, instrumentation and dynamic-analysis
+lists merge the selected build's records with all immediate child builds. Each record
+includes `build_id` and `subproject` (ID/name or null). Parent results come first,
+then children in ID order, with each relation preserving its own pagination cursor.
+The child-build catalog is also paginated. Continuation cursors are opaque and bound
+to the selected build, relation, filter and child catalog; changing those invalidates
+the cursor. A final continuation page can be empty when remaining children have no
+matching records.
+
 GraphQL lists return `items` and `page_info`. Pass `page_info.endCursor` as
 `after` when `hasNextPage` is true. Page sizes are 1–200. Existing per-build
 `offset` arguments remain supported by traversing cursors; do not combine
@@ -175,8 +184,10 @@ and test-summary dates follow CDash's configured dashboard day. These can differ
 when the nightly rollover is not midnight.
 
 Comparisons fetch all relevant records, up to 10,000 per build, before computing
-changes. Larger results fail explicitly. Duplicate test names also fail rather
-than guessing which results correspond. A fixed failure means `FAILED` became
+changes. Larger results fail explicitly. Duplicate test names within the same subproject also fail rather
+than guessing which results correspond. Comparisons match tests and files by
+subproject ID plus name/path, so identically named records in different subprojects
+remain separate. Coverage totals count each submitted subproject record. A fixed failure means `FAILED` became
 `PASSED`; removed or skipped tests are not counted as fixes. Coverage percentages
 are weighted by executable line counts, and file comparisons do not compute
 patch coverage.

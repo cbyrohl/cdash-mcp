@@ -286,7 +286,13 @@ async def get_build_coverage(
 
 @tool
 async def get_coverage_file(
-    build_id: int, path: str, output_offset: int = 0, output_limit: int = 34816, ctx: Context = None
+    build_id: int,
+    path: str,
+    output_offset: int = 0,
+    output_limit: int = 34816,
+    limit: int = 50,
+    after: str | None = None,
+    ctx: Context = None,
 ) -> dict:
     """Exact file's source and covered-line hit counts, if CDash permits source access."""
     _slice_output("", output_offset, output_limit)
@@ -295,7 +301,8 @@ async def get_coverage_file(
         build_id,
         "coverage",
         COVERAGE_FIELDS + " file coveredLines { lineNumber timesHit totalBranches branchesHit }",
-        limit=1,
+        limit=limit,
+        after=after,
         filters={"eq": {"filePath": path}},
     )
     for item in result["items"]:
@@ -329,8 +336,16 @@ async def compare_build_coverage(
             "percent": 100 * tested / (tested + untested) if tested + untested else None,
         }
 
-    a = {r["filePath"]: r for r in base}
-    b = {r["filePath"]: r for r in compare}
+    def index(rows):
+        result = {}
+        for row in rows:
+            key = ((row.get("subproject") or {}).get("id", ""), row["filePath"])
+            if key in result:
+                raise CDashError("Duplicate coverage files within a subproject prevent comparison.")
+            result[key] = row
+        return result
+
+    a, b = index(base), index(compare)
     changes = []
     metrics = (
         "linesOfCodeTested",
@@ -345,7 +360,8 @@ async def compare_build_coverage(
         if old is None or new is None or any(old[k] != new[k] for k in metrics):
             changes.append(
                 {
-                    "path": path,
+                    "path": path[1],
+                    "subproject": (new or old).get("subproject"),
                     "base": old,
                     "compare": new,
                     "percentage_point_change": new["linePercentage"] - old["linePercentage"]
@@ -540,9 +556,10 @@ async def compare_builds(
     def index(rows):
         result = {}
         for row in rows:
-            if row["name"] in result:
-                raise CDashError("Duplicate test names prevent an unambiguous comparison.")
-            result[row["name"]] = row
+            key = ((row.get("subproject") or {}).get("id", ""), row["name"])
+            if key in result:
+                raise CDashError("Duplicate test names within a subproject prevent comparison.")
+            result[key] = row
         return result
 
     a, b = index(old), index(new)
@@ -557,7 +574,8 @@ async def compare_builds(
         ):
             changes.append(
                 {
-                    "name": name,
+                    "name": name[1],
+                    "subproject": (now or before).get("subproject"),
                     "base": before,
                     "compare": now,
                     "new_failure": now is not None
@@ -575,6 +593,8 @@ async def compare_builds(
         "total_test_changes": len(changes),
         "new_failures": [r["name"] for r in changes if r["new_failure"]],
         "fixed_failures": [r["name"] for r in changes if r["fixed_failure"]],
+        "new_failure_results": [r for r in changes if r["new_failure"]],
+        "fixed_failure_results": [r for r in changes if r["fixed_failure"]],
         "test_changes": changes[offset : offset + limit],
         "next_offset": offset + limit if offset + limit < len(changes) else None,
     }

@@ -135,12 +135,21 @@ async def test_exact_history_uses_supported_rest(client, cdash_api):
     assert "status" not in request.url.params.values()
 
 
-async def test_stalled_pagination_fails(client):
+async def test_stalled_pagination_fails(client, cdash_api):
     client.token = None
     conn = {"edges": [], "pageInfo": {"hasNextPage": True, "endCursor": None}}
     client._client._transport = httpx.MockTransport(
         lambda r: httpx.Response(200, json={"data": {"build": {"tests": conn}}})
     )
+    malformed = client._client._transport
+    original, _ = cdash_api
+
+    def handle(request):
+        if "children(first:" in json.loads(request.content)["query"]:
+            return original(request)
+        return malformed.handle_request(request)
+
+    client._client._transport = httpx.MockTransport(handle)
     with pytest.raises(CDashError, match="advance"):
         await client.get_build_tests(1, offset=1)
     with pytest.raises(CDashError, match="advance"):
@@ -172,7 +181,7 @@ async def test_public_graphql_needs_no_session(client, cdash_api):
     assert all(request.method == "POST" for request in cdash_api[1])
 
 
-async def test_malformed_connection_is_error(client):
+async def test_malformed_connection_is_error(client, cdash_api):
     client.token = None
     client._client._transport = httpx.MockTransport(
         lambda r: httpx.Response(
@@ -189,5 +198,14 @@ async def test_malformed_connection_is_error(client):
             },
         )
     )
+    malformed = client._client._transport
+    original, _ = cdash_api
+
+    def handle(request):
+        if "children(first:" in json.loads(request.content)["query"]:
+            return original(request)
+        return malformed.handle_request(request)
+
+    client._client._transport = httpx.MockTransport(handle)
     with pytest.raises(CDashError, match="connection records"):
         await client.get_build_tests(1)

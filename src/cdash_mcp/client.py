@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
+import hashlib
+import json
 import os
 from dataclasses import dataclass, field
 from datetime import date as date_type
@@ -197,7 +201,161 @@ class CDashClient:
             raise CDashNotFoundError(f"Build {build_id} was not found or is not accessible.")
         return data["build"]
 
+    async def _build_sources(self, build_id: int) -> list[dict[str, Any]]:
+        """Discover the parent and all immediate children, paginating the catalog."""
+        query = """query($id:ID!,$first:Int!,$after:String) {
+            build(id:$id) {
+                id subProject { id name }
+                children(first:$first,after:$after,orderBy:[{column:ID,order:ASC}]) {
+                    edges { node { id subProject { id name } } }
+                    pageInfo { hasNextPage endCursor }
+                }
+            }
+        }"""
+        sources = []
+        cursor = None
+        while True:
+            data = await self.graphql(query, {"id": str(build_id), "first": 200, "after": cursor})
+            root = data.get("build")
+            if root is None:
+                raise CDashNotFoundError(f"Build {build_id} was not found or is inaccessible.")
+            if not isinstance(root, dict) or not isinstance(root.get("id"), str):
+                raise CDashError("Invalid build metadata in GraphQL response.")
+            if not sources:
+                sources.append({"id": root["id"], "subProject": root.get("subProject")})
+            children = root.get("children")
+            if not isinstance(children, dict) or not isinstance(children.get("edges"), list):
+                raise CDashError("Missing child-build catalog in GraphQL response.")
+            if any(
+                not isinstance(edge, dict)
+                or not isinstance(edge.get("node"), dict)
+                or not isinstance(edge["node"].get("id"), str)
+                for edge in children["edges"]
+            ):
+                raise CDashError("Invalid child-build metadata in GraphQL response.")
+            sources.extend(edge["node"] for edge in children["edges"])
+            page = children.get("pageInfo")
+            if not isinstance(page, dict) or type(page.get("hasNextPage")) is not bool:
+                raise CDashError("Missing child-build pagination information.")
+            if not page["hasNextPage"]:
+                ids = [source["id"] for source in sources]
+                if len(ids) != len(set(ids)):
+                    raise CDashError("Duplicate child builds in CDash response.")
+                return sources
+            next_cursor = page.get("endCursor")
+            if (
+                not children["edges"]
+                or not next_cursor
+                or next_cursor == cursor
+                or len(sources) > 10000
+            ):
+                raise CDashError(
+                    "Child-build catalog exceeds the limit or pagination did not advance."
+                )
+            cursor = next_cursor
+
     async def connection(
+        self,
+        parent: str,
+        identifier: str | int,
+        relation: str,
+        fields: str,
+        limit: int = 50,
+        offset: int = 0,
+        after: str | None = None,
+        filters: dict[str, Any] | None = None,
+        order: str = "ASC",
+    ) -> dict[str, Any]:
+        """Merge build-scoped results without dropping a child's independent cursor."""
+        validate_page(limit, offset)
+        if after and offset:
+            raise CDashError("Use after or offset, not both.")
+        child_relations = {"tests", "buildErrors", "coverage", "commands", "dynamicAnalyses"}
+        if parent != "build" or relation not in child_relations:
+            return await self._direct_connection(
+                parent,
+                identifier,
+                relation,
+                fields,
+                limit,
+                offset,
+                after,
+                filters,
+                order,
+            )
+        sources = await self._build_sources(int(identifier))
+        scope = hashlib.sha256(
+            json.dumps(
+                [str(identifier), relation, fields, filters, order, sources],
+                sort_keys=True,
+            ).encode()
+        ).hexdigest()
+        source_index, source_cursor = 0, None
+        if after:
+            try:
+                if len(after) > 4096:
+                    raise ValueError
+                state = json.loads(base64.urlsafe_b64decode(after.encode()))
+                source_index, source_cursor = state["source"], state["after"]
+                if (
+                    state.get("version") != 1
+                    or state.get("scope") != scope
+                    or type(source_index) is not int
+                    or not 0 <= source_index < len(sources)
+                    or (source_cursor is not None and not isinstance(source_cursor, str))
+                ):
+                    raise ValueError
+            except (ValueError, KeyError, TypeError, binascii.Error) as exc:
+                raise CDashError("Invalid or stale cursor for this build relation/filter.") from exc
+        items = []
+        remaining_offset = offset
+        while source_index < len(sources) and len(items) < limit:
+            source = sources[source_index]
+            size = min(remaining_offset, 200) if remaining_offset else limit - len(items)
+            page = await self._direct_connection(
+                "build",
+                source["id"],
+                relation,
+                fields,
+                size,
+                after=source_cursor,
+                filters=filters,
+                order=order,
+            )
+            records = page["items"]
+            more = page["page_info"].get("hasNextPage")
+            next_cursor = page["page_info"].get("endCursor")
+            if more and (not records or not next_cursor or next_cursor == source_cursor):
+                raise CDashError("CDash child relation pagination did not advance.")
+            if remaining_offset:
+                remaining_offset -= len(records)
+            else:
+                items.extend(
+                    {**record, "build_id": source["id"], "subproject": source.get("subProject")}
+                    for record in records
+                )
+            if more:
+                source_cursor = next_cursor
+            else:
+                source_index += 1
+                source_cursor = None
+        has_next = source_index < len(sources)
+        cursor = None
+        if has_next:
+            cursor = base64.urlsafe_b64encode(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "scope": scope,
+                        "source": source_index,
+                        "after": source_cursor,
+                    },
+                    separators=(",", ":"),
+                ).encode()
+            ).decode()
+        return {"items": items, "page_info": {"hasNextPage": has_next, "endCursor": cursor}}
+
+    async def _direct_connection(
         self,
         parent: str,
         identifier: str | int,
@@ -247,7 +405,7 @@ class CDashClient:
             if not isinstance(conn, dict) or not isinstance(conn.get("edges"), list):
                 raise CDashError(f"Invalid {relation} connection response.")
             page = conn.get("pageInfo")
-            if not isinstance(page, dict):
+            if not isinstance(page, dict) or type(page.get("hasNextPage")) is not bool:
                 raise CDashError("Missing GraphQL pagination information.")
             if any(
                 not isinstance(edge, dict) or not isinstance(edge.get("node"), dict)
