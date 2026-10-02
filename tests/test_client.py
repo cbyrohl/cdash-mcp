@@ -175,8 +175,11 @@ async def test_invalid_status_and_cursor(client):
 
 async def test_public_graphql_needs_no_session(client, cdash_api):
     client.token = None
+    client._client.headers.pop("Authorization")
+    client._client.cookies.clear()
     await client.build(1)
     assert all(request.method == "POST" for request in cdash_api[1])
+    assert all("authorization" not in r.headers and "cookie" not in r.headers for r in cdash_api[1])
 
 
 async def test_malformed_connection_is_error(client, cdash_api):
@@ -223,10 +226,14 @@ async def test_project_cursor_binds_page_size(client):
         )
 
 
-async def test_child_catalog_uses_fixed_pages(client):
+@pytest.mark.parametrize("child_count", [201, 9999, 10000])
+async def test_child_catalog_uses_fixed_pages(client, child_count):
     client.token = None
     calls = []
-    children = [{"id": str(i), "subProject": {"id": str(i), "name": str(i)}} for i in range(2, 203)]
+    children = [
+        {"id": str(i), "subProject": {"id": str(i), "name": str(i)}}
+        for i in range(2, child_count + 2)
+    ]
 
     def handle(request):
         variables = json.loads(request.content)["variables"]
@@ -254,7 +261,38 @@ async def test_child_catalog_uses_fixed_pages(client):
         )
 
     client._client._transport = httpx.MockTransport(handle)
-    sources = await client._build_sources(1)
-    assert len(sources) == 202
-    assert [call["first"] for call in calls] == [200, 200]
-    assert [call["after"] for call in calls] == [None, "200"]
+    if child_count >= 10000:
+        with pytest.raises(CDashError, match="catalog exceeds the limit"):
+            await client._build_sources(1)
+    else:
+        sources = await client._build_sources(1)
+        assert len(sources) == child_count + 1
+    assert all(call["first"] == 200 for call in calls)
+    assert [call["after"] for call in calls] == [None] + [
+        str(i * 200) for i in range(1, len(calls))
+    ]
+
+
+@pytest.mark.parametrize("final_count", [1, 2])
+async def test_comparison_limit_includes_final_page(client, monkeypatch, final_count):
+    page_sizes = [200] * 49 + [199, final_count]
+    calls = 0
+
+    async def connection(*args, **kwargs):
+        nonlocal calls
+        assert kwargs["limit"] == 200
+        assert kwargs["after"] == (str(calls) if calls else None)
+        size = page_sizes[calls]
+        calls += 1
+        return {
+            "items": [{"id": f"{calls}-{i}"} for i in range(size)],
+            "page_info": {"hasNextPage": calls < len(page_sizes), "endCursor": str(calls)},
+        }
+
+    monkeypatch.setattr(client, "connection", connection)
+    if final_count == 2:
+        with pytest.raises(CDashError, match="comparison limit"):
+            await client.all_items("build", 1, "tests", "id")
+    else:
+        assert len(await client.all_items("build", 1, "tests", "id")) == 10000
+    assert calls == len(page_sizes)

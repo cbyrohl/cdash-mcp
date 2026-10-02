@@ -234,6 +234,8 @@ class CDashClient:
             ):
                 raise CDashError("Invalid child-build metadata in GraphQL response.")
             sources.extend(edge["node"] for edge in children["edges"])
+            if len(sources) > 10000:
+                raise CDashError("Child-build catalog exceeds the limit.")
             page = children.get("pageInfo")
             if not isinstance(page, dict) or type(page.get("hasNextPage")) is not bool:
                 raise CDashError("Missing child-build pagination information.")
@@ -243,12 +245,7 @@ class CDashClient:
                     raise CDashError("Duplicate child builds in CDash response.")
                 return sources
             next_cursor = page.get("endCursor")
-            if (
-                not children["edges"]
-                or not next_cursor
-                or next_cursor == cursor
-                or len(sources) > 10000
-            ):
+            if not children["edges"] or not next_cursor or next_cursor == cursor:
                 raise CDashError(
                     "Child-build catalog exceeds the limit or pagination did not advance."
                 )
@@ -410,6 +407,8 @@ class CDashClient:
         while True:
             page = await self.connection(*args, **kwargs, limit=200, after=cursor)
             items.extend(page["items"])
+            if len(items) > 10000:
+                raise CDashError("Result exceeds the comparison limit.")
             if not page["page_info"].get("hasNextPage"):
                 return items
             next_cursor = page["page_info"].get("endCursor")
