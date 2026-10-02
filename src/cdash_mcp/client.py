@@ -261,32 +261,20 @@ class CDashClient:
         relation: str,
         fields: str,
         limit: int = 50,
-        offset: int = 0,
         after: str | None = None,
         filters: dict[str, Any] | None = None,
         order: str = "ASC",
     ) -> dict[str, Any]:
-        """Merge build-scoped results without dropping a child's independent cursor."""
-        validate_page(limit, offset)
-        if after and offset:
-            raise CDashError("Use after or offset, not both.")
+        """Continue one source at a time with a fixed Lighthouse page size."""
+        validate_page(limit)
         child_relations = {"tests", "buildErrors", "coverage", "commands", "dynamicAnalyses"}
-        if parent != "build" or relation not in child_relations:
-            return await self._direct_connection(
-                parent,
-                identifier,
-                relation,
-                fields,
-                limit,
-                offset,
-                after,
-                filters,
-                order,
-            )
-        sources = await self._build_sources(int(identifier))
+        aggregate = parent == "build" and relation in child_relations
+        sources = (
+            await self._build_sources(int(identifier)) if aggregate else [{"id": str(identifier)}]
+        )
         scope = hashlib.sha256(
             json.dumps(
-                [str(identifier), relation, fields, filters, order, sources],
+                [parent, str(identifier), relation, fields, filters, order, limit, sources],
                 sort_keys=True,
             ).encode()
         ).hexdigest()
@@ -298,7 +286,7 @@ class CDashClient:
                 state = json.loads(base64.urlsafe_b64decode(after.encode()))
                 source_index, source_cursor = state["source"], state["after"]
                 if (
-                    state.get("version") != 1
+                    state.get("version") != 2
                     or state.get("scope") != scope
                     or type(source_index) is not int
                     or not 0 <= source_index < len(sources)
@@ -306,46 +294,51 @@ class CDashClient:
                 ):
                     raise ValueError
             except (ValueError, KeyError, TypeError, binascii.Error) as exc:
-                raise CDashError("Invalid or stale cursor for this build relation/filter.") from exc
+                raise CDashError(
+                    "Invalid/stale cursor or changed page size. Keep the original limit, "
+                    "build, relation and filters, or restart without after."
+                ) from exc
         items = []
-        remaining_offset = offset
-        while source_index < len(sources) and len(items) < limit:
+        while source_index < len(sources):
             source = sources[source_index]
-            size = min(remaining_offset, 200) if remaining_offset else limit - len(items)
             page = await self._direct_connection(
-                "build",
+                parent,
                 source["id"],
                 relation,
                 fields,
-                size,
+                limit,
                 after=source_cursor,
                 filters=filters,
                 order=order,
             )
             records = page["items"]
-            more = page["page_info"].get("hasNextPage")
+            more = page["page_info"]["hasNextPage"]
             next_cursor = page["page_info"].get("endCursor")
             if more and (not records or not next_cursor or next_cursor == source_cursor):
-                raise CDashError("CDash child relation pagination did not advance.")
-            if remaining_offset:
-                remaining_offset -= len(records)
-            else:
-                items.extend(
+                raise CDashError("CDash relation pagination did not advance.")
+            if aggregate:
+                items = [
                     {**record, "build_id": source["id"], "subproject": source.get("subProject")}
                     for record in records
-                )
+                ]
+            else:
+                items = records
             if more:
                 source_cursor = next_cursor
             else:
                 source_index += 1
                 source_cursor = None
+            # Never fill a short page from the next child using a different first.
+            # Lighthouse rounds after to a page boundary determined by first.
+            if items:
+                break
         has_next = source_index < len(sources)
         cursor = None
         if has_next:
             cursor = base64.urlsafe_b64encode(
                 json.dumps(
                     {
-                        "version": 1,
+                        "version": 2,
                         "scope": scope,
                         "source": source_index,
                         "after": source_cursor,
@@ -362,66 +355,54 @@ class CDashClient:
         relation: str,
         fields: str,
         limit: int = 50,
-        offset: int = 0,
         after: str | None = None,
         filters: dict[str, Any] | None = None,
         order: str = "ASC",
     ) -> dict[str, Any]:
-        validate_page(limit, offset)
-        if after and offset:
-            raise CDashError("Use after or offset, not both.")
+        validate_page(limit)
         if parent in {"build", "test"} and int(identifier) <= 0:
             raise CDashError("ID must be a positive integer.")
         parent_type = parent.capitalize()
         filter_type = f"{parent_type}{relation[0].upper() + relation[1:]}FiltersMultiFilterInput"
         filter_decl = f",$filters:{filter_type}" if filters else ""
         filter_arg = ",filters:$filters" if filters else ""
-        # Only internal callers supply field/type names; user values are variables.
         key, scalar = ("id", "ID!") if parent in {"build", "test"} else ("project", "String!")
         selector = "id:$id" if parent in {"build", "test"} else "name:$project"
         ordered = relation in {"tests", "buildErrors", "coverage", "builds", "commands", "targets"}
         order_arg = f",orderBy:[{{column:ID,order:{order}}}]" if ordered else ""
-        query = f"""query(${key}:{scalar},$first:Int!,$after:String{filter_decl}) {{
-            {parent}({selector}) {{
-                {relation}(first:$first,after:$after{filter_arg}{order_arg}) {{
-                    edges {{ node {{ {fields} }} }} pageInfo {{ hasNextPage endCursor }}
-                }}
-            }}
+        selection = f"""{relation}(first:$first,after:$after{filter_arg}{order_arg}) {{
+            edges {{ node {{ {fields} }} }} pageInfo {{ hasNextPage endCursor }}
         }}"""
-        cursor = after
-        remaining = offset
-        while True:
-            size = min(remaining, 200) if remaining else limit
-            variables = {key: str(identifier), "first": size, "after": cursor}
-            if filters:
-                variables["filters"] = filters
-            data = await self.graphql(query, variables)
-            root = data.get(parent)
+        if relation == "updateFiles":
+            selection = "updateStep { " + selection + " }"
+        query = f"""query(${key}:{scalar},$first:Int!,$after:String{filter_decl}) {{
+            {parent}({selector}) {{ {selection} }}
+        }}"""
+        variables = {key: str(identifier), "first": limit, "after": after}
+        if filters:
+            variables["filters"] = filters
+        data = await self.graphql(query, variables)
+        root = data.get(parent)
+        if root is None:
+            raise CDashNotFoundError(
+                f"{parent_type} {identifier} was not found or is inaccessible."
+            )
+        if relation == "updateFiles":
+            root = root.get("updateStep")
             if root is None:
-                raise CDashNotFoundError(
-                    f"{parent_type} {identifier} was not found or is inaccessible."
-                )
-            conn = root.get(relation)
-            if not isinstance(conn, dict) or not isinstance(conn.get("edges"), list):
-                raise CDashError(f"Invalid {relation} connection response.")
-            page = conn.get("pageInfo")
-            if not isinstance(page, dict) or type(page.get("hasNextPage")) is not bool:
-                raise CDashError("Missing GraphQL pagination information.")
-            if any(
-                not isinstance(edge, dict) or not isinstance(edge.get("node"), dict)
-                for edge in conn["edges"]
-            ):
-                raise CDashError("Invalid GraphQL connection records.")
-            items = [edge["node"] for edge in conn["edges"]]
-            if not remaining:
-                return {"items": items, "page_info": page}
-            remaining -= len(items)
-            if not page.get("hasNextPage"):
                 return {"items": [], "page_info": {"hasNextPage": False, "endCursor": None}}
-            next_cursor = page.get("endCursor")
-            if not items or not next_cursor or next_cursor == cursor:
-                raise CDashError("CDash pagination did not advance.")
-            cursor = next_cursor
+        conn = root.get(relation)
+        if not isinstance(conn, dict) or not isinstance(conn.get("edges"), list):
+            raise CDashError(f"Invalid {relation} connection response.")
+        page = conn.get("pageInfo")
+        if not isinstance(page, dict) or type(page.get("hasNextPage")) is not bool:
+            raise CDashError("Missing GraphQL pagination information.")
+        if any(
+            not isinstance(edge, dict) or not isinstance(edge.get("node"), dict)
+            for edge in conn["edges"]
+        ):
+            raise CDashError("Invalid GraphQL connection records.")
+        return {"items": [edge["node"] for edge in conn["edges"]], "page_info": page}
 
     async def all_items(self, *args: Any, **kwargs: Any) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []
@@ -484,7 +465,6 @@ class CDashClient:
         build_id: int,
         warnings: bool = False,
         limit: int = 30,
-        offset: int = 0,
         after: str | None = None,
     ) -> dict[str, Any]:
         return await self.connection(
@@ -496,7 +476,6 @@ class CDashClient:
             targetName language workingDirectory exitCondition
         """,
             limit,
-            offset,
             after,
             {"eq": {"type": "WARNING" if warnings else "ERROR"}},
         )
@@ -506,15 +485,12 @@ class CDashClient:
         build_id: int,
         status_filter: str | None = None,
         limit: int = 50,
-        offset: int = 0,
         after: str | None = None,
     ) -> dict[str, Any]:
         if status_filter is not None and status_filter not in STATUS:
             raise CDashError("status_filter must be passed, failed or notrun.")
         filters = {"eq": {"status": STATUS[status_filter]}} if status_filter else None
-        return await self.connection(
-            "build", build_id, "tests", TEST_FIELDS, limit, offset, after, filters
-        )
+        return await self.connection("build", build_id, "tests", TEST_FIELDS, limit, after, filters)
 
     async def get_configure(self, build_id: int) -> dict[str, Any]:
         return await self.build(build_id, "id configure { command log returnValue }")
@@ -554,7 +530,7 @@ class CDashClient:
         )
 
     async def get_dynamic_analysis(
-        self, build_id: int, limit: int = 50, offset: int = 0, after: str | None = None
+        self, build_id: int, limit: int = 50, after: str | None = None
     ) -> dict[str, Any]:
         return await self.connection(
             "build",
@@ -562,6 +538,5 @@ class CDashClient:
             "dynamicAnalyses",
             "id name status checker fullCommandLine defects { type value }",
             limit,
-            offset,
             after,
         )

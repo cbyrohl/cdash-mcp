@@ -202,3 +202,22 @@ async def test_coverage_comparison_rejects_unusable_paths(
     monkeypatch.setattr(client, "all_items", coverage_with_unusable_path)
     with pytest.raises(ToolError, match=f"bad-path-record.*build {affected_build}.*file path"):
         await s.compare_build_coverage(1, 2, ctx=ctx)
+
+
+async def test_graphql_list_tools_expose_cursors_without_offsets():
+    tools = {tool.name: tool for tool in await s.mcp.list_tools()}
+    for name in (
+        "get_build_errors",
+        "get_build_tests",
+        "get_dynamic_analysis",
+        "get_coverage_comparison",
+    ):
+        assert "offset" not in tools[name].inputSchema["properties"]
+        assert "after" in tools[name].inputSchema["properties"]
+    for name in (
+        "get_failing_tests",
+        "get_test_summary",
+        "compare_builds",
+        "compare_build_coverage",
+    ):
+        assert "offset" in tools[name].inputSchema["properties"]

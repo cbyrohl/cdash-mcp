@@ -19,7 +19,7 @@ async def subprojects(client):
     }
 
     def connection(rows, variables):
-        start = int(variables.get("after") or 0)
+        start = int(variables.get("after") or 0) // variables["first"] * variables["first"]
         end = start + variables["first"]
         return {
             "edges": [{"node": r} for r in rows[start:end]],
@@ -96,23 +96,31 @@ async def test_parent_and_children_paginate_without_gaps(subprojects):
     client, calls = subprojects
     first = await client.get_build_tests(100, limit=2)
     second = await client.get_build_tests(100, limit=2, after=first["page_info"]["endCursor"])
-    assert [r["id"] for r in first["items"] + second["items"]] == ["1000", "110", "111", "120"]
+    third = await client.get_build_tests(100, limit=2, after=second["page_info"]["endCursor"])
+    assert [r["id"] for p in [first, second, third] for r in p["items"]] == [
+        "1000",
+        "110",
+        "111",
+        "120",
+    ]
     assert first["items"][0]["build_id"] == "100"
-    assert first["items"][1]["subproject"] == {"id": "a", "name": "a"}
-    assert second["items"][1]["subproject"]["id"] == "b"
-    # Exhaust empty children as well; no fabricated records.
-    tail = await client.get_build_tests(100, after=second["page_info"]["endCursor"])
+    assert second["items"][0]["subproject"] == {"id": "a", "name": "a"}
+    assert third["items"][0]["subproject"]["id"] == "b"
+    tail = await client.get_build_tests(100, limit=2, after=third["page_info"]["endCursor"])
     assert tail["items"] == [] and not tail["page_info"]["hasNextPage"]
-    offset = await client.get_build_tests(100, offset=2, limit=2)
-    assert [r["id"] for r in offset["items"]] == ["111", "120"]
     assert len([c for c in calls if "children(first:" in c["query"]]) >= 3
+    # Each relation request uses the public page size, even at child boundaries.
+    assert all(c["variables"]["first"] == 2 for c in calls if "tests(first:" in c["query"])
 
 
 async def test_filter_applies_to_every_child(subprojects):
     client, _ = subprojects
     result = await client.get_build_tests(100, "failed", limit=2)
     assert [(r["build_id"], r["name"]) for r in result["items"]] == [("11", "shared")]
-    assert not result["page_info"]["hasNextPage"]
+    final = await client.get_build_tests(
+        100, "failed", limit=2, after=result["page_info"]["endCursor"]
+    )
+    assert not final["items"] and not final["page_info"]["hasNextPage"]
 
 
 @pytest.mark.parametrize("relation", ["buildErrors", "coverage", "commands"])
@@ -127,9 +135,9 @@ async def test_cursor_cannot_be_reused_for_different_build_or_filter(subprojects
     page = await client.get_build_tests(100, limit=1)
     cursor = page["page_info"]["endCursor"]
     with pytest.raises(CDashError, match="cursor"):
-        await client.get_build_tests(200, after=cursor)
+        await client.get_build_tests(200, limit=1, after=cursor)
     with pytest.raises(CDashError, match="cursor"):
-        await client.get_build_tests(100, "failed", after=cursor)
+        await client.get_build_tests(100, "failed", limit=1, after=cursor)
 
 
 async def test_comparisons_preserve_subprojects(subprojects, ctx):

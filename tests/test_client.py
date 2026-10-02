@@ -109,13 +109,11 @@ async def test_transport_error(client):
         await client.get_dashboard("thor")
 
 
-async def test_cursor_pagination_and_offset(client, cdash_api):
+async def test_cursor_pagination(client, cdash_api):
     first = await client.get_build_tests(1, limit=1)
     second = await client.get_build_tests(1, limit=1, after=first["page_info"]["endCursor"])
-    offset = await client.get_build_tests(1, limit=1, offset=1)
     assert first["items"][0]["id"] == "10"
-    assert second["items"][0]["id"] == offset["items"][0]["id"] == "11"
-    assert (await client.get_build_tests(1, offset=200))["items"] == []
+    assert second["items"][0]["id"] == "11"
     _, requests = cdash_api
     payloads = [json.loads(r.content) for r in requests if r.method == "POST"]
     assert any(p["variables"].get("after") == "1" for p in payloads)
@@ -151,7 +149,7 @@ async def test_stalled_pagination_fails(client, cdash_api):
 
     client._client._transport = httpx.MockTransport(handle)
     with pytest.raises(CDashError, match="advance"):
-        await client.get_build_tests(1, offset=1)
+        await client.get_build_tests(1, limit=1)
     with pytest.raises(CDashError, match="advance"):
         await client.all_items("build", 1, "tests", "id")
 
@@ -168,11 +166,11 @@ def test_invalid_page(limit, offset):
         validate_page(limit, offset)
 
 
-async def test_invalid_status_and_page_combination(client):
+async def test_invalid_status_and_cursor(client):
     with pytest.raises(CDashError):
         await client.get_build_tests(1, "Not Run")
     with pytest.raises(CDashError):
-        await client.get_build_tests(1, after="cursor", offset=1)
+        await client.get_build_tests(1, after="not-a-cursor")
 
 
 async def test_public_graphql_needs_no_session(client, cdash_api):
@@ -209,3 +207,54 @@ async def test_malformed_connection_is_error(client, cdash_api):
     client._client._transport = httpx.MockTransport(handle)
     with pytest.raises(CDashError, match="connection records"):
         await client.get_build_tests(1)
+
+
+async def test_changed_page_size_requires_restart(client):
+    first = await client.get_build_tests(1, limit=1)
+    with pytest.raises(CDashError, match="page size"):
+        await client.get_build_tests(1, limit=2, after=first["page_info"]["endCursor"])
+
+
+async def test_project_cursor_binds_page_size(client):
+    first = await client.connection("project", "thor", "tests", "id", limit=1)
+    with pytest.raises(CDashError, match="page size"):
+        await client.connection(
+            "project", "thor", "tests", "id", limit=2, after=first["page_info"]["endCursor"]
+        )
+
+
+async def test_child_catalog_uses_fixed_pages(client):
+    client.token = None
+    calls = []
+    children = [{"id": str(i), "subProject": {"id": str(i), "name": str(i)}} for i in range(2, 203)]
+
+    def handle(request):
+        variables = json.loads(request.content)["variables"]
+        calls.append(variables)
+        first = variables["first"]
+        start = int(variables.get("after") or 0) // first * first
+        end = start + first
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "build": {
+                        "id": "1",
+                        "subProject": None,
+                        "children": {
+                            "edges": [{"node": child} for child in children[start:end]],
+                            "pageInfo": {
+                                "hasNextPage": end < len(children),
+                                "endCursor": str(min(end, len(children))),
+                            },
+                        },
+                    }
+                }
+            },
+        )
+
+    client._client._transport = httpx.MockTransport(handle)
+    sources = await client._build_sources(1)
+    assert len(sources) == 202
+    assert [call["first"] for call in calls] == [200, 200]
+    assert [call["after"] for call in calls] == [None, "200"]

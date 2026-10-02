@@ -164,16 +164,23 @@ Build-scoped test, compiler-diagnostic, coverage, instrumentation and dynamic-an
 lists merge the selected build's records with all immediate child builds. Each record
 includes `build_id` and `subproject` (ID/name or null). Parent results come first,
 then children in ID order, with each relation preserving its own pagination cursor.
-The child-build catalog is also paginated. Continuation cursors are opaque and bound
-to the selected build, relation, filter and child catalog; changing those invalidates
-the cursor. A final continuation page can be empty when remaining children have no
+The child-build catalog is also paginated. Each result page contains records from
+one source build; pages can be shorter than `limit` at a child boundary.
+Continuation cursors are opaque and bound to the selected build, relation, filter,
+child catalog and page size; changing those invalidates the cursor. A final continuation page can be empty when remaining children have no
 matching records.
 
 GraphQL lists return `items` and `page_info`. Pass `page_info.endCursor` as
-`after` when `hasNextPage` is true. Page sizes are 1–200. Existing per-build
-`offset` arguments remain supported by traversing cursors; do not combine
-`offset` and `after`. REST test queries retain local `limit`/`offset` slicing and
-identify that explicitly in their results.
+`after` when `hasNextPage` is true. Page sizes are 1–200. Keep the same `limit`
+on every continuation request; to change the page size, restart without `after`.
+Lighthouse interprets its underlying cursor using the requested page size, so the
+client validates this to prevent repeated or skipped records. Raw CDash cursors
+and cursors from older MCP versions are not accepted.
+
+GraphQL list tools no longer accept `offset`; they do not fetch and discard pages
+to simulate skipping records. REST test queries and computed comparison results
+retain local `limit`/`offset` slicing. Text logs retain their independent
+`output_offset` argument.
 
 Logs use `output_offset` and `output_limit` (default 34,816 characters). A sliced
 text object includes `text`, `total_characters`, `offset` and `next_offset`.

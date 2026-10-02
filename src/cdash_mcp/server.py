@@ -134,7 +134,6 @@ async def get_build_errors(
     build_id: int,
     warnings: bool = False,
     limit: int = 30,
-    offset: int = 0,
     after: str | None = None,
     output_offset: int = 0,
     output_limit: int = 34816,
@@ -144,7 +143,7 @@ async def get_build_errors(
     output_offset.
     """
     _slice_output("", output_offset, output_limit)
-    page = await _get_client(ctx).get_build_errors(build_id, warnings, limit, offset, after)
+    page = await _get_client(ctx).get_build_errors(build_id, warnings, limit, after)
     for item in page["items"]:
         item["stdError"] = _slice_output(item.get("stdError") or "", output_offset, output_limit)
         item["stdOutput"] = _slice_output(item.get("stdOutput") or "", output_offset, output_limit)
@@ -156,14 +155,13 @@ async def get_build_tests(
     build_id: int,
     status_filter: str | None = None,
     limit: int = 50,
-    offset: int = 0,
     after: str | None = None,
     ctx: Context = None,
 ) -> dict:
     """Tests, stable IDs and timing statistics. Filter: passed, failed or notrun. Use after to
     paginate.
     """
-    page = await _get_client(ctx).get_build_tests(build_id, status_filter, limit, offset, after)
+    page = await _get_client(ctx).get_build_tests(build_id, status_filter, limit, after)
     for item in page["items"]:
         item["test_url"] = f"{_get_client(ctx).base_url.rstrip('/')}/tests/{item['id']}"
     return page
@@ -228,27 +226,20 @@ async def get_build_update(build_id: int, ctx: Context = None) -> dict:
 
 @tool
 async def get_update_files(
-    build_id: int, limit: int = 50, after: str | None = None, ctx: Context = None
+    build_id: int,
+    limit: int = 50,
+    after: str | None = None,
+    ctx: Context = None,
 ) -> dict:
-    """Changed source files, authors and commit messages; returns paginated update records."""
-    validate_page(limit)
-    client = _get_client(ctx)
-    data = await client.graphql(
-        """query($id:ID!,$first:Int!,$after:String) {
-        build(id:$id) { updateStep { updateFiles(first:$first,after:$after) {
-            edges { node { id fileName authorName log revision priorRevision status } }
-            pageInfo { hasNextPage endCursor }
-        } } }
-    }""",
-        {"id": str(build_id), "first": limit, "after": after},
+    """Changed source files, authors and commit messages; paginated update records."""
+    return await _get_client(ctx).connection(
+        "build",
+        build_id,
+        "updateFiles",
+        "id fileName authorName log revision priorRevision status",
+        limit=limit,
+        after=after,
     )
-    if data.get("build") is None:
-        raise CDashError("Build was not found or is inaccessible.")
-    update = data["build"].get("updateStep")
-    if update is None:
-        return {"items": [], "page_info": {"hasNextPage": False, "endCursor": None}}
-    conn = update["updateFiles"]
-    return {"items": [e["node"] for e in conn["edges"]], "page_info": conn["pageInfo"]}
 
 
 @tool
@@ -393,13 +384,13 @@ async def get_coverage_comparison(
     date: str | None = None,
     build_id: int | None = None,
     limit: int = 50,
-    offset: int = 0,
+    after: str | None = None,
     compare_build_id: int | None = None,
     ctx: Context = None,
 ) -> dict:
     """Compatibility alias. Supply build_id for coverage, plus compare_build_id for comparison."""
     validate_date(date)
-    validate_page(limit, offset)
+    validate_page(limit)
     if build_id is None:
         raise CDashError(
             "Supply build_id; use search_builds to choose builds. "
@@ -410,16 +401,18 @@ async def get_coverage_comparison(
     if build["project"]["name"] != project:
         raise CDashError("build_id belongs to a different project.")
     if compare_build_id is not None:
-        return await compare_build_coverage(build_id, compare_build_id, limit, offset, ctx)
-    return await client.connection("build", build_id, "coverage", COVERAGE_FIELDS, limit, offset)
+        if after is not None:
+            raise CDashError("Use compare_build_coverage to paginate comparison results.")
+        return await compare_build_coverage(build_id, compare_build_id, limit, ctx=ctx)
+    return await client.connection("build", build_id, "coverage", COVERAGE_FIELDS, limit, after)
 
 
 @tool
 async def get_dynamic_analysis(
-    build_id: int, limit: int = 50, offset: int = 0, after: str | None = None, ctx: Context = None
+    build_id: int, limit: int = 50, after: str | None = None, ctx: Context = None
 ) -> dict:
     """Memory/sanitizer check results with checker, command and per-type defect counts."""
-    return await _get_client(ctx).get_dynamic_analysis(build_id, limit, offset, after)
+    return await _get_client(ctx).get_dynamic_analysis(build_id, limit, after)
 
 
 @tool

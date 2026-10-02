@@ -208,7 +208,9 @@ def cdash_api():
         elif relation in {"commands", "dynamicAnalyses", "updateFiles"}:
             rows = []
         if rows is not None:
-            start = int(variables.get("after") or "0")
+            # Lighthouse decodes a cursor to an offset, then rounds to first-sized pages.
+            first = variables["first"]
+            start = int(variables.get("after") or "0") // first * first
             end = start + variables["first"]
             conn = {
                 "edges": [{"node": r} for r in rows[start:end]],
