@@ -20,7 +20,8 @@ classifiers = [
 ]
 dependencies = [
     "httpx>=0.28.1",
-    "mcp[cli]>=1.26.0",
+    # mcp 2.x renamed FastMCP to MCPServer and dropped mcp.server.fastmcp; pin until migrated.
+    "mcp[cli]>=1.26.0,<2",
 ]
 
 [project.scripts]
